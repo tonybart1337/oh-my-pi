@@ -715,11 +715,13 @@ export class CollabHost {
 	#broadcastEvent(event: AgentSessionEvent): void {
 		if (event.type === "message_start") this.#messageSeq++;
 		if (!this.#broadcastAllowed()) return;
-		const frame = encodeEventFrame(serializeReplicatedEvent(event).json);
+		const { value, json } = serializeReplicatedEvent(event);
+		const frame = encodeEventFrame(json);
 		// Each update carries the whole message so far, so a newer one supersedes
 		// any still queued for the same message (#16956). Keyed per message so the
-		// last update of one message is never superseded by the next one's.
-		if (event.type === "message_update") this.#socket?.sendLatest(`message_update:${this.#messageSeq}`, frame);
+		// last update of one message is never superseded by the next one's. The
+		// bounded event lets the socket fold superseded streaming deltas forward.
+		if (event.type === "message_update") this.#socket?.sendLatest(`message_update:${this.#messageSeq}`, frame, value);
 		else this.#socket?.send(frame);
 	}
 

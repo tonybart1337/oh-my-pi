@@ -12,8 +12,11 @@
 import { getProxyForUrl } from "@oh-my-pi/pi-ai/utils/proxy";
 import { logger } from "@oh-my-pi/pi-utils";
 import { open, sealSerialized } from "./crypto";
-import type { CollabFrame, EncodedFrame, RelayControlMessage } from "./protocol";
+import { type CollabFrame, type EncodedFrame, encodeEventFrame, type RelayControlMessage } from "./protocol";
 import { packEnvelope, unpackEnvelope } from "./protocol";
+import { MAX_REPLICATED_PAYLOAD_BYTES } from "./replication-shrink";
+
+type CollabEvent = Extract<CollabFrame, { t: "event" }>["event"];
 
 const RELAY_CLOSE_REASONS: Record<number, string> = {
 	4001: "room closed",
@@ -74,6 +77,13 @@ const WS_BACKPRESSURE_THRESHOLD = 64 * 1024;
 const WS_BACKPRESSURE_DRAIN_THRESHOLD = 32 * 1024;
 const WS_BACKPRESSURE_DRAIN_RETRY_MS = 25;
 
+/** An assistant streaming delta queued by {@link CollabSocket.sendLatest}, kept so a superseding update can carry it. */
+interface PendingMessageDelta {
+	contentIndex: number;
+	type: "text_delta" | "thinking_delta" | "toolcall_delta";
+	delta: string;
+}
+
 interface PendingSend {
 	frames: Iterator<CollabFrame | string>;
 	targetPeer: number;
@@ -86,6 +96,8 @@ interface PendingSend {
 	head?: CollabFrame | string;
 	/** Supersession key from {@link CollabSocket.sendLatest}; a newer send under it cancels this one while queued. */
 	key?: string;
+	/** The streaming delta this `sendLatest` frame carries; folded into the update that supersedes it. */
+	messageDelta?: PendingMessageDelta;
 }
 
 export interface CollabSocketOptions {
@@ -213,15 +225,71 @@ export class CollabSocket {
 	 * of updates for as long as the stream outpaces the drain. Survivors keep
 	 * emission order: the newest frame is appended, never moved ahead of frames
 	 * queued before it.
+	 *
+	 * Pass the event an {@link EncodedFrame} carries as `event` so a superseded
+	 * assistant text, thinking, or tool-call delta is not lost: its delta string
+	 * is prepended to the newest update's delta for the same content block, so
+	 * incremental consumers still see every fragment while the snapshot stays the
+	 * newest. A fold that would exceed the replication ceiling is skipped; the
+	 * guest then recovers superseded text and thinking from the snapshots. A
+	 * {@link flush} that covered a superseded frame settles only once its
+	 * successor is sealed, so a graceful close still delivers the folded deltas.
 	 */
-	sendLatest(key: string, frame: CollabFrame | EncodedFrame): void {
+	sendLatest(key: string, frame: CollabFrame | EncodedFrame, event?: CollabEvent): void {
+		if (this.#closed) return;
 		const head = this.#pendingSends[0];
+		const carried = typeof frame === "string" ? event : frame.t === "event" ? frame.event : undefined;
+		const update = carried?.type === "message_update" ? carried : undefined;
+		const delta = update?.message.role === "assistant" ? update.assistantMessageEvent : undefined;
+		const messageDelta: PendingMessageDelta | undefined =
+			delta && (delta.type === "text_delta" || delta.type === "thinking_delta" || delta.type === "toolcall_delta")
+				? { contentIndex: delta.contentIndex, type: delta.type, delta: delta.delta }
+				: undefined;
+		const supersededPrepared: (() => void)[] = [];
+		let folded = "";
+		for (const pending of this.#pendingSends) {
+			if (pending === head || pending.key !== key) continue;
+			if (pending.onPrepared) supersededPrepared.push(pending.onPrepared);
+			pending.onPrepared = undefined;
+			const previous = pending.messageDelta;
+			if (
+				messageDelta &&
+				previous?.contentIndex === messageDelta.contentIndex &&
+				previous.type === messageDelta.type
+			) {
+				folded += previous.delta;
+			}
+		}
+		let outgoing = frame;
+		if (update && delta && messageDelta && folded) {
+			const combined = folded + messageDelta.delta;
+			// Never retain the caller's event: providers mutate their messages after each callback.
+			const encoded = encodeEventFrame(
+				JSON.stringify({ ...update, assistantMessageEvent: { ...delta, delta: combined } }),
+			);
+			if (Buffer.byteLength(encoded) <= MAX_REPLICATED_PAYLOAD_BYTES) {
+				outgoing = encoded;
+				messageDelta.delta = combined;
+			}
+		}
 		this.#discardWhere(pending => pending !== head && pending.key === key);
-		this.#sendOne(frame, 0, key);
+		this.#sendOne(outgoing, 0, key, messageDelta, supersededPrepared);
 	}
 
-	#sendOne(frame: CollabFrame | EncodedFrame, targetPeer: number, key?: string): void {
-		if (this.#closed) return;
+	#sendOne(
+		frame: CollabFrame | EncodedFrame,
+		targetPeer: number,
+		key?: string,
+		messageDelta?: PendingMessageDelta,
+		supersededPrepared: readonly (() => void)[] = [],
+	): void {
+		const settleSuperseded = (): void => {
+			for (const resolve of supersededPrepared) resolve();
+		};
+		if (this.#closed) {
+			settleSuperseded();
+			return;
+		}
 		try {
 			const serialized = typeof frame === "string" ? frame : JSON.stringify(frame);
 			const prepared = Promise.withResolvers<void>();
@@ -230,11 +298,16 @@ export class CollabSocket {
 				[serialized].values(),
 				targetPeer,
 				Buffer.byteLength(serialized),
-				prepared.resolve,
+				() => {
+					prepared.resolve();
+					settleSuperseded();
+				},
 				true,
 				key,
+				messageDelta,
 			);
 		} catch (err) {
+			settleSuperseded();
 			this.#failFatal(`could not serialize collab frame: ${String(err)}; rejoin to resync`);
 		}
 	}
@@ -311,6 +384,7 @@ export class CollabSocket {
 		onPrepared?: () => void,
 		eager = false,
 		key?: string,
+		messageDelta?: PendingMessageDelta,
 	): void {
 		// The queue invariant, enforced in one place: targeted work is only ever
 		// admitted for a peer still being served. A batch queued for a peer that has
@@ -327,7 +401,7 @@ export class CollabSocket {
 			this.#failOverload();
 			return;
 		}
-		this.#pendingSends.push({ frames, targetPeer, bytes, cancelled: false, eager, onPrepared, key });
+		this.#pendingSends.push({ frames, targetPeer, bytes, cancelled: false, eager, onPrepared, key, messageDelta });
 		this.#pendingSendBytes += bytes;
 		this.#pumpSends();
 	}
