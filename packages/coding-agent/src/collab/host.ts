@@ -696,7 +696,8 @@ export class CollabHost {
 	/** Broadcast one session event, bounded and serialized exactly once. */
 	#broadcastEvent(event: AgentSessionEvent): void {
 		if (!this.#broadcastAllowed()) return;
-		this.#socket?.send(encodeEventFrame(serializeReplicatedEvent(event).json));
+		const { value, json } = serializeReplicatedEvent(event);
+		this.#socket?.send(encodeEventFrame(json), 0, value);
 	}
 
 	#handleFrame(frame: CollabFrame, fromPeer: number): void {

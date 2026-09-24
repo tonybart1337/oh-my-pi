@@ -14,6 +14,9 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { open, sealSerialized } from "./crypto";
 import type { CollabFrame, EncodedFrame, RelayControlMessage } from "./protocol";
 import { packEnvelope, unpackEnvelope } from "./protocol";
+import { MAX_REPLICATED_PAYLOAD_BYTES } from "./replication-shrink";
+
+type CollabEvent = Extract<CollabFrame, { t: "event" }>["event"];
 
 const RELAY_CLOSE_REASONS: Record<number, string> = {
 	4001: "room closed",
@@ -65,6 +68,13 @@ const WS_BACKPRESSURE_THRESHOLD = 64 * 1024;
 const WS_BACKPRESSURE_DRAIN_THRESHOLD = 32 * 1024;
 const WS_BACKPRESSURE_DRAIN_RETRY_MS = 25;
 
+interface PendingMessageDelta {
+	timestamp: number;
+	contentIndex: number;
+	type: "text_delta" | "thinking_delta" | "toolcall_delta";
+	delta: string;
+}
+
 interface PendingSend {
 	frames: Iterator<CollabFrame | string>;
 	targetPeer: number;
@@ -75,6 +85,8 @@ interface PendingSend {
 	preparedEnvelope?: Uint8Array;
 	/** Next batch frame, pulled right after a write so an exhausted batch leaves the head at once. */
 	head?: CollabFrame | string;
+	/** Only unstarted, adjacent deltas may share a cumulative message snapshot. */
+	messageDelta?: PendingMessageDelta;
 }
 
 export interface CollabSocketOptions {
@@ -181,15 +193,74 @@ export class CollabSocket {
 	/**
 	 * Queue one frame. An {@link EncodedFrame} is sealed as-is, so a caller that
 	 * already serialized the payload (to measure or bound it) does not pay for a
-	 * second `JSON.stringify`.
+	 * second `JSON.stringify`; pass the event it encodes as `event` so adjacent
+	 * streaming deltas can still coalesce.
 	 */
-	send(frame: CollabFrame | EncodedFrame, targetPeer = 0): void {
+	send(frame: CollabFrame | EncodedFrame, targetPeer = 0, event?: CollabEvent): void {
 		if (this.#closed) return;
 		try {
+			const carried = typeof frame === "string" ? event : frame.t === "event" ? frame.event : undefined;
+			const update = carried?.type === "message_update" ? carried : undefined;
+			const delta = update?.assistantMessageEvent;
+			let messageDelta: PendingMessageDelta | undefined;
+			const pending = this.#pendingSends.at(-1);
+			if (
+				update?.message.role === "assistant" &&
+				delta &&
+				(delta.type === "text_delta" || delta.type === "thinking_delta" || delta.type === "toolcall_delta")
+			) {
+				messageDelta = {
+					timestamp: update.message.timestamp,
+					contentIndex: delta.contentIndex,
+					type: delta.type,
+					delta: delta.delta,
+				};
+				const previous = pending?.messageDelta;
+				if (
+					previous &&
+					pending.targetPeer === targetPeer &&
+					!this.#retiredPeers.has(targetPeer) &&
+					previous.timestamp === messageDelta.timestamp &&
+					previous.contentIndex === messageDelta.contentIndex &&
+					previous.type === messageDelta.type
+				) {
+					// The snapshot is cumulative, but speech and other delta consumers
+					// still need every fragment. Never retain the caller's mutable frame.
+					const combined = previous.delta + delta.delta;
+					const outgoing: CollabFrame = {
+						t: "event",
+						event: { ...update, assistantMessageEvent: { ...delta, delta: combined } },
+					};
+					const serialized = JSON.stringify(outgoing);
+					const bytes = Buffer.byteLength(serialized);
+					// Fall back to separate frames rather than grow a merged delta beyond
+					// the host's replication ceiling or clip fragments needed by guests.
+					if (bytes <= MAX_REPLICATED_PAYLOAD_BYTES) {
+						if (this.#pendingSendBytes - pending.bytes + bytes > MAX_PENDING_SEND_BYTES) {
+							this.#failOverload();
+							return;
+						}
+						this.#pendingSendBytes += bytes - pending.bytes;
+						pending.bytes = bytes;
+						pending.frames = [serialized].values();
+						messageDelta.delta = combined;
+						pending.messageDelta = messageDelta;
+						// Keep its preparation promise: flush() must wait for the replacement.
+						return;
+					}
+				}
+			}
 			const serialized = typeof frame === "string" ? frame : JSON.stringify(frame);
 			const prepared = Promise.withResolvers<void>();
 			this.#sendChain = Promise.all([this.#sendChain, prepared.promise]).then(() => {});
-			this.#enqueueSend([serialized].values(), targetPeer, Buffer.byteLength(serialized), prepared.resolve, true);
+			this.#enqueueSend(
+				[serialized].values(),
+				targetPeer,
+				Buffer.byteLength(serialized),
+				prepared.resolve,
+				true,
+				messageDelta,
+			);
 		} catch (err) {
 			this.#failFatal(`could not serialize collab frame: ${String(err)}; rejoin to resync`);
 		}
@@ -266,6 +337,7 @@ export class CollabSocket {
 		bytes: number,
 		onPrepared?: () => void,
 		eager = false,
+		messageDelta?: PendingMessageDelta,
 	): void {
 		// The queue invariant, enforced in one place: targeted work is only ever
 		// admitted for a peer still being served. A batch queued for a peer that has
@@ -282,7 +354,7 @@ export class CollabSocket {
 			this.#failOverload();
 			return;
 		}
-		this.#pendingSends.push({ frames, targetPeer, bytes, cancelled: false, eager, onPrepared });
+		this.#pendingSends.push({ frames, targetPeer, bytes, cancelled: false, eager, onPrepared, messageDelta });
 		this.#pendingSendBytes += bytes;
 		this.#pumpSends();
 	}
@@ -325,6 +397,9 @@ export class CollabSocket {
 			if (!pending.eager && !(await this.#waitForWritable(generation))) return;
 			if (this.#closed || generation !== this.#sendGeneration) return;
 			if (pending.cancelled) continue;
+			// Once pulled, a frame can be sealing or already buffered: replacing it
+			// would lose deltas or resolve flush() before its replacement was sealed.
+			pending.messageDelta = undefined;
 			let value = pending.head;
 			pending.head = undefined;
 			if (value === undefined) {
