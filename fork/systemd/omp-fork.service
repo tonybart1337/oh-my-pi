@@ -1,0 +1,13 @@
+[Unit]
+Description=Rebuild the omp fork on the newest upstream release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Declared, not inherited: at boot the user manager has only the bare default PATH.
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/omp-fork update
+TimeoutStartSec=1h
+Nice=10
+IOSchedulingClass=idle

@@ -5,7 +5,6 @@
 import { Command, Flags } from "@oh-my-pi/pi-utils/cli";
 import { updateHelp as commandHelp } from "../cli/command-help";
 import * as pluginCli from "../cli/plugin-cli";
-import * as updateCli from "../cli/update-cli";
 import { CliUsageError } from "../cli/usage-error";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 
@@ -33,11 +32,19 @@ export default class Update extends Command {
 		if (flags.plugins) {
 			await pluginCli.runPluginCommand({ action: "upgrade", args: [], flags: {} });
 		} else {
-			await updateCli.runUpdateCommand({
-				force: flags.force,
-				check: flags.check,
-				channel: flags.canary ? "canary" : flags.stable ? "stable" : undefined,
-			});
+			// Fork build: omp-fork rebuilds this binary from upstream releases plus the
+			// fork's patches. Upstream's updater would replace it with an unpatched release.
+			if (flags.canary || flags.stable || flags.force) {
+				throw new CliUsageError("This omp is a fork build; --canary/--stable/--force are not supported");
+			}
+			const command = ["omp-fork", flags.check ? "status" : "update"];
+			let proc: Bun.Subprocess;
+			try {
+				proc = Bun.spawn(command, { stdio: ["inherit", "inherit", "inherit"] });
+			} catch (err) {
+				throw new Error(`This omp is a fork build; updates run through \`${command.join(" ")}\``, { cause: err });
+			}
+			process.exitCode = await proc.exited;
 		}
 	}
 }
