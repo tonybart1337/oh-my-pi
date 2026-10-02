@@ -191,7 +191,9 @@ cmd_setup() {
 	install -Dm 0644 "$REPO/fork/systemd/omp-fork.service" "$units/omp-fork.service"
 	install -Dm 0644 "$REPO/fork/systemd/omp-fork.timer" "$units/omp-fork.timer"
 	systemctl --user daemon-reload
-	systemctl --user enable --now omp-fork.timer
+	systemctl --user enable omp-fork.timer
+	# A running timer keeps its old schedule until restarted.
+	systemctl --user restart omp-fork.timer
 }
 
 main() {
