@@ -403,6 +403,7 @@ export class CollabHost {
 			}
 		};
 		socket.onRoomRecreated = () => this.#handleRoomRecreated();
+		socket.onResync = () => void this.#resyncPeers();
 		socket.onFrame = (frame, fromPeer) => this.#handleFrame(frame, fromPeer);
 		socket.onControl = msg => {
 			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
@@ -451,7 +452,10 @@ export class CollabHost {
 		// resolves), and anything that happens after its welcome snapshot must
 		// reach it; the local registry work below is independent of that.
 		this.#unsubscribe = this.#ctx.session.subscribe(event => {
-			if (isWireAgentEvent(event)) this.#send({ t: "event", event: shrinkReplicatedEvent(event) });
+			// Skip the shrink work too when nobody would receive the frame.
+			if (this.#peers.size > 0 && isWireAgentEvent(event)) {
+				this.#send({ t: "event", event: shrinkReplicatedEvent(event) });
+			}
 			this.#onEventForState(event);
 		});
 		// Subagent frames publish on the session tree's observability bus at
@@ -665,6 +669,10 @@ export class CollabHost {
 		// current-session data. Do not strand guests if it settles during a
 		// provisional /resume that later rolls back. All other traffic stays gated.
 		if (this.ending || (!this.#sessionStillCurrent() && frame.t !== "ui-request-end")) return;
+		// No guest has been welcomed, so a broadcast reaches nobody: a joiner's
+		// welcome snapshot covers everything before it. Queueing it anyway lets an
+		// unwatched session fill the send backlog.
+		if (toPeer === 0 && this.#peers.size === 0) return;
 		this.#socket?.send(frame, toPeer);
 	}
 
@@ -753,7 +761,24 @@ export class CollabHost {
 		const cleanName = name.trim().slice(0, 64) || `guest-${fromPeer}`;
 		const canWrite = this.#verifyWriteToken(writeToken);
 		this.#peers.set(fromPeer, { name: cleanName, canWrite });
+		if (!this.#sendWelcome(fromPeer, canWrite)) return;
+		this.#ctx.session.emitNotice(
+			"info",
+			`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
+			"collab",
+		);
+		this.#updateStatusSegment();
+		this.#scheduleStateBroadcast();
+	}
 
+	/**
+	 * Full state for one peer: welcome, transcript snapshot, and (for writers) every
+	 * pending question. Guests treat a later welcome as a reset, which is what makes
+	 * this the resync path as well as the join path.
+	 *
+	 * @returns false when there is no socket to send on.
+	 */
+	#sendWelcome(peerId: number, canWrite: boolean): boolean {
 		// Enqueue the snapshot synchronously so live traffic cannot overtake it;
 		// materialize its chunks only as the transport drains.
 		// `copyForReplication` rather than the default `structuredClone`: a payload
@@ -776,7 +801,7 @@ export class CollabHost {
 		}
 		const entries = snapshot.entries.filter(isWireSessionEntry);
 		const socket = this.#socket;
-		if (!socket) return;
+		if (!socket) return false;
 		this.#send(
 			{
 				t: "welcome",
@@ -787,21 +812,31 @@ export class CollabHost {
 				entryCount: entries.length,
 				readOnly: canWrite ? undefined : true,
 			},
-			fromPeer,
+			peerId,
 		);
-		socket.sendBatch(this.#snapshotChunks(entries), fromPeer);
+		socket.sendBatch(this.#snapshotChunks(entries), peerId);
 		if (canWrite) {
 			for (const pending of this.#pendingUi.values()) {
-				this.#send({ t: "ui-request", request: pending.request }, fromPeer);
+				this.#send({ t: "ui-request", request: pending.request }, peerId);
 			}
 		}
-		this.#ctx.session.emitNotice(
-			"info",
-			`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
-			"collab",
-		);
-		this.#updateStatusSegment();
-		this.#scheduleStateBroadcast();
+		return true;
+	}
+
+	/**
+	 * The socket shed an overflowing send backlog, so every guest missed frames:
+	 * welcome each one again. Waits out a session transition first, as a joiner
+	 * would; a committed switch stops the room instead.
+	 */
+	async #resyncPeers(): Promise<void> {
+		while (!this.ending && this.#ctx.session.isSessionTransitioning) {
+			await this.#ctx.session.waitForSessionTransition();
+		}
+		if (!this.#guestTrafficAllowed() || this.#peers.size === 0) return;
+		for (const [peerId, peer] of this.#peers) this.#sendWelcome(peerId, peer.canWrite);
+		this.#ctx.showStatus(`Collab: resynced ${this.#peers.size} guest(s) after a send backlog overflow`, {
+			dim: true,
+		});
 	}
 
 	/**

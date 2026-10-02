@@ -101,6 +101,12 @@ export class CollabSocket {
 	onControl?: (msg: RelayControlMessage) => void;
 	/** Fires on each close; `willReconnect` distinguishes retries from terminal shutdown. */
 	onClose?: (reason: string, willReconnect: boolean) => void;
+	/**
+	 * Host only: the send backlog overflowed, was discarded, and the transport has
+	 * since drained. Every peer missed frames, so the owner must send each one its
+	 * full state again (welcome + snapshot). Fires at most once per drain.
+	 */
+	onResync?: () => void;
 
 	readonly #opts: CollabSocketOptions;
 	#ws: WebSocket | null = null;
@@ -133,6 +139,11 @@ export class CollabSocket {
 	#recvChain: Promise<void> = Promise.resolve();
 	#pendingSends: PendingSend[] = [];
 	#pendingSendBytes = 0;
+	/**
+	 * Host overflow recovery in progress: sends are dropped until the transport
+	 * drains, so nothing refills the queue and each drain costs one snapshot.
+	 */
+	#resyncing = false;
 	/**
 	 * Peers the relay has retired. Sole authority for the queue invariant: **every
 	 * entry in {@link #pendingSends} with a non-zero `targetPeer` is work for a
@@ -182,6 +193,7 @@ export class CollabSocket {
 	connect(): void {
 		if (this.#ws || this.#retryTimer) return;
 		this.#closed = false;
+		this.#resyncing = false;
 		this.#retryMissingRoom = false;
 		this.#hostReclaimUntil = undefined;
 		this.#attempt = 0;
@@ -189,7 +201,8 @@ export class CollabSocket {
 	}
 
 	send(frame: CollabFrame, targetPeer = 0): void {
-		if (this.#closed) return;
+		// The goodbye still goes out: the resync it would supersede never happens.
+		if (this.#closed || (this.#resyncing && frame.t !== "bye")) return;
 		try {
 			const update = frame.t === "event" && frame.event.type === "message_update" ? frame.event : undefined;
 			const delta = update?.assistantMessageEvent;
@@ -259,7 +272,7 @@ export class CollabSocket {
 
 	/** Keeps a snapshot contiguous with its welcome and ahead of subsequent live traffic. */
 	sendBatch(frames: Iterable<CollabFrame>, targetPeer = 0): void {
-		if (this.#closed) return;
+		if (this.#closed || this.#resyncing) return;
 		this.#enqueueSend(frames[Symbol.iterator](), targetPeer, 0);
 	}
 
@@ -352,10 +365,39 @@ export class CollabSocket {
 	}
 
 	#failOverload(): void {
-		const recovery = this.#opts.role === "host" ? "restart sharing and rejoin" : "rejoin";
+		// A guest's queue holds its own prompts and commands: dropping them silently
+		// would lose user input, so its overflow stays terminal. The host's queue only
+		// holds state it can rebuild from the session, so it resyncs instead.
+		if (this.#opts.role === "host") {
+			this.#shedBacklogForResync();
+			return;
+		}
 		this.#failFatal(
-			`collab send backlog exceeded its limit; ${recovery} to resync and check whether pending commands ran before retrying`,
+			"collab send backlog exceeded its limit; rejoin to resync and check whether pending commands ran before retrying",
 		);
+	}
+
+	#shedBacklogForResync(): void {
+		if (this.#closed) return;
+		const discarded = this.#pendingSends.length;
+		this.discardPendingSends();
+		if (this.#resyncing) return;
+		logger.warn("collab: send backlog exceeded its limit; resyncing guests once the transport drains", {
+			discarded,
+		});
+		this.#resyncing = true;
+		void this.#resyncWhenWritable();
+	}
+
+	async #resyncWhenWritable(): Promise<void> {
+		// A reconnect in between is fine: the open wakes this wait, and the owner
+		// resyncs whoever is in the room by then.
+		while (this.#resyncing && !this.#closed) {
+			if (await this.#waitForWritable(this.#sendGeneration)) break;
+		}
+		if (!this.#resyncing || this.#closed) return;
+		this.#resyncing = false;
+		this.onResync?.();
 	}
 
 	#pumpSends(): void {
