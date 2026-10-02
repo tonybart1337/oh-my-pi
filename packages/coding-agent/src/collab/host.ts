@@ -407,6 +407,7 @@ export class CollabHost {
 			}
 		};
 		socket.onRoomRecreated = () => this.#handleRoomRecreated();
+		socket.onResync = () => void this.#resyncPeers();
 		socket.onFrame = (frame, fromPeer) => this.#handleFrame(frame, fromPeer);
 		socket.onControl = msg => {
 			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
@@ -679,6 +680,10 @@ export class CollabHost {
 		// current-session data. Do not strand guests if it settles during a
 		// provisional /resume that later rolls back. All other traffic stays gated.
 		if (this.ending || (!this.#sessionStillCurrent() && frame.t !== "ui-request-end")) return;
+		// No guest has been welcomed, so a broadcast reaches nobody: a joiner's
+		// welcome snapshot covers everything before it. Queueing it anyway lets an
+		// unwatched session fill the send backlog.
+		if (toPeer === 0 && this.#peers.size === 0) return;
 		this.#socket?.send(frame, toPeer);
 	}
 
@@ -784,11 +789,27 @@ export class CollabHost {
 		}
 		const cleanName = name.trim().slice(0, 64) || `guest-${fromPeer}`;
 		const canWrite = this.#verifyWriteToken(writeToken);
-		const firstPeer = this.#peers.size === 0;
 		this.#peers.set(fromPeer, { name: cleanName, canWrite });
+		if (!this.#sendWelcome(fromPeer, canWrite)) return;
+		this.#ctx.session.emitNotice(
+			"info",
+			`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
+			"collab",
+		);
+		this.#updateStatusSegment();
+		this.#scheduleStateBroadcast();
+	}
 
+	/**
+	 * Full state for one peer: welcome, transcript snapshot, and (for writers) every
+	 * pending question. Guests treat a later welcome as a reset, which is what makes
+	 * this the resync path as well as the join path.
+	 *
+	 * @returns false when there is no socket to send on.
+	 */
+	#sendWelcome(peerId: number, canWrite: boolean): boolean {
 		const socket = this.#socket;
-		if (!socket) return;
+		if (!socket) return false;
 		// Serialize the snapshot synchronously: live traffic queued after this
 		// cannot overtake it, and host rewrites of an entry in place cannot leak
 		// into it later, so the live entries are read without a defensive deep
@@ -800,7 +821,7 @@ export class CollabHost {
 		// State broadcasts pause while no guest is joined, so the dedupe baseline
 		// may predate this welcome; with no other peer to keep current, the welcome
 		// becomes the baseline.
-		if (firstPeer) this.#lastStateJson = JSON.stringify(state);
+		if (this.#peers.size === 1) this.#lastStateJson = JSON.stringify(state);
 		this.#send(
 			{
 				t: "welcome",
@@ -811,21 +832,31 @@ export class CollabHost {
 				entryCount: snapshotEntries.json.length,
 				readOnly: canWrite ? undefined : true,
 			},
-			fromPeer,
+			peerId,
 		);
-		socket.sendBatch(this.#snapshotChunks(snapshotEntries.json, snapshotEntries.bytes), fromPeer);
+		socket.sendBatch(this.#snapshotChunks(snapshotEntries.json, snapshotEntries.bytes), peerId);
 		if (canWrite) {
 			for (const pending of this.#pendingUi.values()) {
-				this.#send({ t: "ui-request", request: pending.request }, fromPeer);
+				this.#send({ t: "ui-request", request: pending.request }, peerId);
 			}
 		}
-		this.#ctx.session.emitNotice(
-			"info",
-			`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
-			"collab",
-		);
-		this.#updateStatusSegment();
-		this.#scheduleStateBroadcast();
+		return true;
+	}
+
+	/**
+	 * The socket shed an overflowing send backlog, so every guest missed frames:
+	 * welcome each one again. Waits out a session transition first, as a joiner
+	 * would; a committed switch stops the room instead.
+	 */
+	async #resyncPeers(): Promise<void> {
+		while (!this.ending && this.#ctx.session.isSessionTransitioning) {
+			await this.#ctx.session.waitForSessionTransition();
+		}
+		if (!this.#guestTrafficAllowed() || this.#peers.size === 0) return;
+		for (const [peerId, peer] of this.#peers) this.#sendWelcome(peerId, peer.canWrite);
+		this.#ctx.showStatus(`Collab: resynced ${this.#peers.size} guest(s) after a send backlog overflow`, {
+			dim: true,
+		});
 	}
 
 	/**
