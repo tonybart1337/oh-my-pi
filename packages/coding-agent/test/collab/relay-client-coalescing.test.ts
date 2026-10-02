@@ -22,6 +22,7 @@ import {
 } from "./helpers/throttled-host";
 
 const HIGH_WATER_MARK = 64 * 1024;
+const MIB = 1024 * 1024;
 const DRAIN_FRAME = { t: "bye", reason: "coalescing-test-complete" } as const;
 const KEY = "message_update:1";
 const sockets: CollabSocket[] = [];
@@ -347,6 +348,29 @@ describe("CollabSocket.sendLatest streaming deltas", () => {
 		expect(delta.endsWith(lastPiece)).toBe(true);
 		expect(cumulative.endsWith(delta)).toBe(true);
 		expect(delta.length).toBeLessThan(cumulative.length);
+	});
+
+	it("sheds the backlog and resyncs once drained when a superseding update grows the queue past its byte limit", async () => {
+		const harness = await createHarness();
+		let resyncs = 0;
+		harness.host.onResync = () => {
+			resyncs++;
+		};
+		await holdPrepared(harness, () => harness.host.send({ t: "error", message: "hold the transport" }));
+		harness.host.send({ t: "prompt", text: "x".repeat(15 * MIB + MIB / 2) });
+		harness.host.sendLatest(KEY, deltaFrame("a", assistant("x".repeat(128 * 1024))));
+		harness.host.sendLatest(KEY, deltaFrame("b", assistant("x".repeat(400 * 1024))));
+		// Dropped while recovering: nothing may refill the queue before the resync.
+		harness.host.sendLatest(KEY, deltaFrame("c", assistant("c")));
+		harness.host.send({ t: "prompt", text: "dropped" });
+		expect(resyncs).toBe(0);
+
+		await drain(harness);
+		expect(harness.closes).toEqual([]);
+		expect(harness.host.isOpen).toBe(true);
+		expect(resyncs).toBe(1);
+		expect(deltas(harness.receivers[0]!.frames)).toEqual([]);
+		expect(harness.receivers[0]!.frames.filter(frame => frame.t === "prompt")).toEqual([]);
 	});
 });
 

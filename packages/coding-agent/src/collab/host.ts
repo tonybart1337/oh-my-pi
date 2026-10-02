@@ -388,7 +388,7 @@ export class CollabHost {
 		// The queue can refuse a targeted frame and the caller has no timeout, so track
 		// who actually holds the dialog. With no writer connected yet, the ask waits for
 		// the first one to join; writers that all refused it can never answer.
-		const hadWritable = this.#hasWritablePeers();
+		const hadWritable = this.#writerRefusalIsFinal();
 		for (const peerId of this.#sendWritablePeers({ t: "ui-request", request: fullRequest })) recipients.add(peerId);
 		this.#pendingUi.set(reqId, {
 			request: fullRequest,
@@ -401,7 +401,13 @@ export class CollabHost {
 		return promise;
 	}
 
-	#hasWritablePeers(): boolean {
+	/**
+	 * Whether writers refusing an ask means none will ever hold it: some are present,
+	 * and the socket is not recovering from a backlog overflow. While it is, it
+	 * refuses everything, and the resync's welcomes replay every unanswered ask.
+	 */
+	#writerRefusalIsFinal(): boolean {
+		if (this.#socket?.resyncPending) return false;
 		for (const peer of this.#peers.values()) {
 			if (peer.canWrite) return true;
 		}
@@ -423,8 +429,9 @@ export class CollabHost {
 	/**
 	 * Dismiss a settled ask on every writer. A holder the queue refused for capacity
 	 * alone would keep the dialog open with nothing left to close it, so the end falls
-	 * back to a broadcast, which replica-bearing admission delivers or ends the room
-	 * over. Guests ignore an end for a request they never held. A holder that left or
+	 * back to a broadcast, which replica-bearing admission delivers or, on the host's
+	 * own overload, replaces with a resync whose fresh welcome clears the dialog.
+	 * Guests ignore an end for a request they never held. A holder that left or
 	 * was shed needs none: its rejoin clears every presentation.
 	 */
 	#endUiRequest(reqId: number, recipients: ReadonlySet<number>): void {
@@ -446,7 +453,7 @@ export class CollabHost {
 	 * answer awaiting a session transition owns the outcome instead.
 	 */
 	#dropAskRecipient(peer: number): void {
-		const writersRemain = this.#hasWritablePeers();
+		const writersRemain = this.#writerRefusalIsFinal();
 		for (const pending of this.#pendingUi.values()) {
 			if (!pending.recipients.delete(peer) || pending.recipients.size > 0) continue;
 			if (writersRemain && !pending.responsePending) pending.settle({ kind: "unavailable" });
@@ -486,6 +493,7 @@ export class CollabHost {
 		};
 		socket.onRoomRecreated = () => this.#handleRoomRecreated();
 		socket.onPeerOverload = peer => this.#handlePeerOverload(peer);
+		socket.onResync = discardedPeers => void this.#resyncPeers(discardedPeers);
 		socket.onFrame = (frame, fromPeer) => this.#handleFrame(frame, fromPeer);
 		socket.onControl = msg => {
 			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
@@ -761,6 +769,10 @@ export class CollabHost {
 		// current-session data. Do not strand guests if it settles during a
 		// provisional /resume that later rolls back. All other traffic stays gated.
 		if (this.#sendSuppressed(frame)) return;
+		// No guest has been welcomed, so a broadcast reaches nobody: a joiner's
+		// welcome snapshot covers everything before it. Queueing it anyway lets an
+		// unwatched session fill the send backlog.
+		if (toPeer === 0 && this.#peers.size === 0) return;
 		this.#socket?.send(frame, toPeer);
 	}
 
@@ -895,12 +907,35 @@ export class CollabHost {
 		}
 		const cleanName = name.trim().slice(0, 64) || `guest-${fromPeer}`;
 		const canWrite = this.#verifyWriteToken(writeToken);
-		const firstPeer = this.#peers.size === 0;
 		const registered = this.#peers.get(fromPeer);
 		this.#peers.set(fromPeer, { name: cleanName, canWrite });
+		if (!this.#sendWelcome(fromPeer, canWrite)) {
+			// The guest applies nothing before a welcome, so record nothing for it either.
+			if (registered) this.#peers.set(fromPeer, registered);
+			else this.#peers.delete(fromPeer);
+			logger.debug("collab: welcome batch was not admitted; leaving the peer unregistered", { fromPeer });
+			return;
+		}
+		this.#ctx.session.emitNotice(
+			"info",
+			`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
+			"collab",
+		);
+		this.#updateStatusSegment();
+		this.#scheduleStateBroadcast();
+	}
 
+	/**
+	 * Full state for one peer as one queue entry: welcome, transcript snapshot, and
+	 * (for writers) every pending question. Guests treat a later welcome as a reset,
+	 * which is what makes this the resync path as well as the join path.
+	 *
+	 * @returns false when there is no socket or the queue refused the batch; the
+	 * caller decides what becomes of the peer.
+	 */
+	#sendWelcome(peerId: number, canWrite: boolean): boolean {
 		const socket = this.#socket;
-		if (!socket) return;
+		if (!socket) return false;
 		// Serialize the snapshot synchronously: live traffic queued after this
 		// cannot overtake it, and host rewrites of an entry in place cannot leak
 		// into it later, so the live entries are read without a defensive deep
@@ -925,30 +960,46 @@ export class CollabHost {
 		let retainedBytes = Buffer.byteLength(welcome);
 		for (const bytes of snapshotEntries.bytes) retainedBytes += bytes;
 		for (const ask of asks) retainedBytes += Buffer.byteLength(ask);
-		if (!socket.sendBatch(this.#welcomeBatch(welcome, snapshotEntries, asks), fromPeer, retainedBytes)) {
-			// The guest applies nothing before a welcome, so record nothing for it either.
-			if (registered) this.#peers.set(fromPeer, registered);
-			else this.#peers.delete(fromPeer);
-			logger.debug("collab: welcome batch was not admitted; leaving the peer unregistered", { fromPeer });
-			return;
-		}
+		if (!socket.sendBatch(this.#welcomeBatch(welcome, snapshotEntries, asks), peerId, retainedBytes)) return false;
 		// State broadcasts pause while no guest is joined, so the dedupe baseline
 		// may predate this welcome; with no other peer to keep current, the welcome
 		// becomes the baseline.
-		if (firstPeer) this.#lastStateJson = JSON.stringify(state);
+		if (this.#peers.size === 1) this.#lastStateJson = JSON.stringify(state);
 		if (canWrite) {
-			for (const pending of replayed) pending.recipients.add(fromPeer);
+			for (const pending of replayed) pending.recipients.add(peerId);
 		} else {
 			// A hello without the write token demotes the peer; it can no longer answer.
-			this.#dropAskRecipient(fromPeer);
+			this.#dropAskRecipient(peerId);
 		}
-		this.#ctx.session.emitNotice(
-			"info",
-			`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
-			"collab",
-		);
-		this.#updateStatusSegment();
-		this.#scheduleStateBroadcast();
+		return true;
+	}
+
+	/**
+	 * The socket discarded an overflowing send backlog, so every guest missed frames:
+	 * welcome each one again. Waits out a session transition first, as a joiner
+	 * would; a committed switch stops the room instead. A guest whose fresh welcome
+	 * the queue refuses is shed like any overloaded peer and told to rejoin, as is
+	 * an unregistered peer whose queued frames (a shed peer's rejoin notice) went
+	 * with the backlog.
+	 */
+	async #resyncPeers(discardedPeers: ReadonlySet<number>): Promise<void> {
+		while (!this.ending && this.#ctx.session.isSessionTransitioning) {
+			await this.#ctx.session.waitForSessionTransition();
+		}
+		if (this.#stopped || !this.#guestTrafficAllowed()) return;
+		for (const peer of discardedPeers) {
+			if (this.#peers.has(peer) || !this.#socket?.isServing(peer) || this.#sendResync(peer)) continue;
+			this.#unnotified.add(peer);
+			this.#scheduleResyncRetry();
+		}
+		if (this.#peers.size === 0) return;
+		const peers = [...this.#peers];
+		for (const [peerId, peer] of peers) {
+			if (!this.#sendWelcome(peerId, peer.canWrite)) this.#handlePeerOverload(peerId);
+		}
+		this.#ctx.showStatus(`Collab: resynced ${peers.length} guest(s) after a send backlog overflow`, {
+			dim: true,
+		});
 	}
 
 	/**
@@ -1112,7 +1163,7 @@ export class CollabHost {
 				return;
 			}
 			// Re-pose only to writers not already holding it, and record who took it.
-			const hadWritable = this.#hasWritablePeers();
+			const hadWritable = this.#writerRefusalIsFinal();
 			const holders = new Set(pending.recipients);
 			for (const peerId of this.#sendWritablePeers({ t: "ui-request", request: pending.request }, holders)) {
 				pending.recipients.add(peerId);

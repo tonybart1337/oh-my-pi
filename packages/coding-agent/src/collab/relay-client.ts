@@ -125,6 +125,14 @@ export class CollabSocket {
 	onClose?: (reason: string, willReconnect: boolean) => void;
 	/** A targeted backlog was discarded to keep the room alive; the peer must resync. Always deferred to a microtask. */
 	onPeerOverload?: (peerId: number) => void;
+	/**
+	 * Host only: the send backlog overflowed with no peer left to shed, was
+	 * discarded, and the transport has since drained. Every peer missed frames, so
+	 * the owner must send each one its full state again (welcome + snapshot).
+	 * `discardedPeers` holds the targets of discarded targeted frames, which may
+	 * include peers the owner no longer registers. Fires at most once per drain.
+	 */
+	onResync?: (discardedPeers: ReadonlySet<number>) => void;
 
 	readonly #opts: CollabSocketOptions;
 	#ws: WebSocket | null = null;
@@ -163,6 +171,13 @@ export class CollabSocket {
 	/** Serializes open() so frames are delivered in arrival order. */
 	#recvChain: Promise<void> = Promise.resolve();
 	#pendingSends: PendingSend[] = [];
+	/**
+	 * Host overflow recovery in progress: sends are refused until the transport
+	 * drains, so nothing refills the queue and each drain costs one snapshot.
+	 */
+	#resyncing = false;
+	/** Targets of the targeted frames the overflow discarded, reported by {@link onResync}. */
+	#resyncDiscardedPeers = new Set<number>();
 	/**
 	 * Peers the relay has retired. Sole authority for the queue invariant: **every
 	 * entry in {@link #pendingSends} with a non-zero `targetPeer` is work for a
@@ -218,6 +233,7 @@ export class CollabSocket {
 	connect(): void {
 		if (this.#ws || this.#retryTimer) return;
 		this.#closed = false;
+		this.#resyncing = false;
 		this.#retryMissingRoom = false;
 		this.#hostReclaimUntil = undefined;
 		this.#attempt = 0;
@@ -255,7 +271,7 @@ export class CollabSocket {
 	 * @returns whether the newest frame was admitted.
 	 */
 	sendLatest(key: string, frame: CollabFrame | EncodedFrame, event?: CollabEvent): boolean {
-		if (this.#closed) return false;
+		if (this.#closed || this.#resyncing) return false;
 		const head = this.#pendingSends[0];
 		const carried = typeof frame === "string" ? event : frame.t === "event" ? frame.event : undefined;
 		const update = carried?.type === "message_update" ? carried : undefined;
@@ -306,7 +322,8 @@ export class CollabSocket {
 		const settleSuperseded = (): void => {
 			for (const resolve of supersededPrepared) resolve();
 		};
-		if (this.#closed) {
+		// The goodbye still goes out: the resync it would supersede never happens.
+		if (this.#closed || (this.#resyncing && (typeof frame === "string" || frame.t !== "bye"))) {
 			settleSuperseded();
 			return false;
 		}
@@ -351,7 +368,7 @@ export class CollabSocket {
 	 * @returns whether the batch was admitted.
 	 */
 	sendBatch(frames: Iterable<CollabFrame | EncodedFrame>, targetPeer: number, retainedBytes: number): boolean {
-		if (this.#closed) return false;
+		if (this.#closed || this.#resyncing) return false;
 		return this.#enqueueSend({
 			frames: frames[Symbol.iterator](),
 			targetPeer,
@@ -419,6 +436,7 @@ export class CollabSocket {
 		this.#roomGeneration++;
 		this.#retiredPeers.clear();
 		this.#shedPeers.clear();
+		this.#resyncDiscardedPeers.clear();
 		const discarded = this.#discardWhere(pending => pending.targetPeer !== 0);
 		if (discarded > 0) logger.debug("collab: discarded targeted sends across a reconnect", { discarded });
 	}
@@ -434,7 +452,8 @@ export class CollabSocket {
 	 *   advisory is refused, targeted work may only displace queued advisories.
 	 *   A replica-bearing broadcast displaces advisories, then sheds the peer
 	 *   holding most of the exhausted resource; a queue of nothing but replica
-	 *   broadcasts is the host's own overload and ends the room.
+	 *   broadcasts is the host's own overload: a guest ends its connection, a host
+	 *   discards the backlog and resyncs every peer once drained ({@link onResync}).
 	 * - The head's charge is waived, so a session larger than the whole budget is
 	 *   shareable and live traffic queues behind it instead of shedding its peer.
 	 *
@@ -542,10 +561,49 @@ export class CollabSocket {
 	}
 
 	#failOverload(): void {
-		const recovery = this.#opts.role === "host" ? "restart sharing and rejoin" : "rejoin";
+		// A guest's queue holds its own prompts and commands: dropping them silently
+		// would lose user input, so its overflow stays terminal. The host's queue only
+		// holds state it can rebuild from the session, so it resyncs instead.
+		if (this.#opts.role === "host") {
+			this.#shedBacklogForResync();
+			return;
+		}
 		this.#failFatal(
-			`collab send backlog exceeded its limit; ${recovery} to resync and check whether pending commands ran before retrying`,
+			"collab send backlog exceeded its limit; rejoin to resync and check whether pending commands ran before retrying",
 		);
+	}
+
+	#shedBacklogForResync(): void {
+		if (this.#closed) return;
+		const discarded = this.#pendingSends.length;
+		for (const pending of this.#pendingSends) {
+			if (pending.targetPeer !== 0) this.#resyncDiscardedPeers.add(pending.targetPeer);
+		}
+		this.discardPendingSends();
+		if (this.#resyncing) return;
+		logger.warn("collab: send backlog exceeded its limit; resyncing guests once the transport drains", {
+			discarded,
+		});
+		this.#resyncing = true;
+		void this.#resyncWhenWritable();
+	}
+
+	async #resyncWhenWritable(): Promise<void> {
+		// A reconnect in between is fine: the open wakes this wait, and the owner
+		// resyncs whoever is in the room by then.
+		while (this.#resyncing && !this.#closed) {
+			if (await this.#waitForWritable(this.#sendGeneration)) break;
+		}
+		if (!this.#resyncing || this.#closed) return;
+		this.#resyncing = false;
+		const discardedPeers = this.#resyncDiscardedPeers;
+		this.#resyncDiscardedPeers = new Set();
+		this.onResync?.(discardedPeers);
+	}
+
+	/** Host overflow recovery is waiting for the transport to drain; every send but a goodbye is refused. */
+	get resyncPending(): boolean {
+		return this.#resyncing;
 	}
 
 	#pumpSends(): void {
@@ -701,6 +759,7 @@ export class CollabSocket {
 		this.#roomGeneration++;
 		this.#retiredPeers.clear();
 		this.#shedPeers.clear();
+		this.#resyncDiscardedPeers.clear();
 	}
 
 	#clearBackpressureDrain(): void {
