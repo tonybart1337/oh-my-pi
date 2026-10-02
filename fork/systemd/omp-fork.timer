@@ -2,8 +2,10 @@
 Description=Periodically rebuild the omp fork
 
 [Timer]
-OnStartupSec=2min
-OnUnitActiveSec=6h
+# Calendar, not OnUnitActiveSec: that counts from the service's last activation and
+# goes permanently idle when there is none; Persistent= only applies to OnCalendar
+# and catches up a slot missed while the machine was off.
+OnCalendar=*-*-* 00/6:00:00
 RandomizedDelaySec=10min
 Persistent=true
 Unit=omp-fork.service
