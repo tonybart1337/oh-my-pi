@@ -413,16 +413,24 @@ describe("CollabSocket adjacent streaming deltas", () => {
 		expect(received.at(-1)).toEqual(final);
 	});
 
-	it("fails explicitly when a bounded replacement grows the queue past its byte limit", async () => {
+	it("sheds the backlog and resyncs once drained when a bounded replacement grows the queue past its byte limit", async () => {
 		const harness = await createHarness();
+		let resyncs = 0;
+		harness.host.onResync = () => {
+			resyncs++;
+		};
 		await holdPrepared(harness, { t: "error", message: "hold the transport" });
 		harness.host.send({ t: "prompt", text: "x".repeat(15 * MIB + MIB / 2) });
 		harness.host.send(deltaFrame("a", assistant("x".repeat(128 * 1024))));
-		expect(harness.closes).toEqual([]);
 		harness.host.send(deltaFrame("b", assistant("x".repeat(400 * 1024))));
-		expect(harness.closes).toHaveLength(1);
-		expect(harness.closes[0]).toMatchObject({ reconnect: false });
-		expect(harness.closes[0]!.reason).toContain("resync");
-		expect(harness.host.isOpen).toBe(false);
+		// Dropped while recovering: nothing may refill the queue before the resync.
+		harness.host.send(deltaFrame("c", assistant("c")));
+		expect(resyncs).toBe(0);
+
+		await drain(harness);
+		expect(harness.closes).toEqual([]);
+		expect(harness.host.isOpen).toBe(true);
+		expect(resyncs).toBe(1);
+		expect(deltas(harness.receivers[0]!.frames)).toEqual([]);
 	});
 });
