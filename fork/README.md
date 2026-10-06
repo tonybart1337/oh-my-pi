@@ -7,7 +7,7 @@ The stock `omp` is left alone; switching to the fork is a separate, manual decis
 
 | Command | Effect |
 |---|---|
-| `omp-fork update` | fetch upstream tags; rebase the patches onto the newest `vX.Y.Z` (patches already upstream drop out); type-check, run the collab tests, build, install, push `tony/stable` |
+| `omp-fork update` | fetch upstream tags; rebase the patches onto the newest `vX.Y.Z` whose natives are on npm (tags upstream never published are skipped; patches already upstream drop out); type-check, run the collab tests, build, install, push `tony/stable` |
 | `omp-fork install` | rebuild and install the branch as it is |
 | `omp-fork status` | installed build, patch series, newest upstream release |
 | `omp-fork setup` | install the script and the `omp-fork` systemd user timer (every 6h) |
