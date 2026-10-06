@@ -39,9 +39,17 @@ die() {
 
 git_() { git -C "$REPO" "$@"; }
 
+# The newest vX.Y.Z tag whose prebuilt natives are on npm. Upstream sometimes tags a
+# version it never publishes; waiting on that tag would stall the fork forever.
 latest_release_tag() {
+	local published
+	published=$(npm view @oh-my-pi/pi-natives-linux-x64 versions --json 2>/dev/null |
+		jq -r '[.] | flatten | join(" ")') || return 1
 	# Read all input: an early exit (head/grep -m1) SIGPIPEs git and pipefail aborts.
-	git_ tag -l 'v[0-9]*' --sort=-v:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ && !found { print; found = 1 }'
+	git_ tag -l 'v[0-9]*' --sort=-v:refname | awk -v published="$published" '
+		BEGIN { n = split(published, v, " "); for (i = 1; i <= n; i++) ok["v" v[i]] = 1 }
+		/^v[0-9]+\.[0-9]+\.[0-9]+$/ && ($0 in ok) && !found { print; found = 1 }
+		END { exit !found }'
 }
 
 # The release tag the branch currently sits on.
@@ -126,7 +134,7 @@ cmd_update() {
 
 	local base latest target id
 	base=$(base_tag "$BRANCH")
-	latest=$(latest_release_tag)
+	latest=$(latest_release_tag) || die "no upstream release tag with natives on npm (npm unreachable?)"
 	target=$base
 
 	if [[ "$latest" != "$base" ]]; then
@@ -138,10 +146,6 @@ cmd_update() {
 	fi
 	if [[ "$target" == "$base" && "$(installed_build)" == "$(jq -r .version "$REPO/packages/coding-agent/package.json")-$(git_ rev-parse --short=10 "$BRANCH")" ]]; then
 		log "up to date: $(installed_build) on $base"
-		return 0
-	fi
-	if [[ "$target" != "$base" ]] && ! npm view "@oh-my-pi/pi-natives-linux-x64@${target#v}" version >/dev/null 2>&1; then
-		log "$target is tagged but its natives are not on npm yet; retrying next run"
 		return 0
 	fi
 
@@ -182,7 +186,7 @@ cmd_status() {
 	printf 'branch:    %s on %s (%s)\n' "$BRANCH" "$base" "$REPO"
 	git_ log --format='  %h %s' "$base..$BRANCH"
 	git_ fetch -q --tags "$UPSTREAM" 2>/dev/null || log "fetching $UPSTREAM failed; showing local tags"
-	printf 'upstream:  %s\n' "$(latest_release_tag)"
+	printf 'upstream:  %s\n' "$(latest_release_tag || echo unknown)"
 }
 
 cmd_setup() {
