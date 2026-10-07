@@ -187,6 +187,20 @@ describe("runtime thread services: async jobs", () => {
 		});
 	});
 
+	it("shows a worker-homed job's lastOutputAt on the worker's own snapshot rows", async () => {
+		const manager = newManager();
+		const probe = await startWorker();
+		const id = await jobId(probe, manager, "Worker");
+
+		await probe("progress", id, "compiling");
+		const lastOutputAt = manager.getJob(id)?.lastOutputAt;
+		expect(lastOutputAt).toBeNumber();
+		expect(await probe("snapshot", manager, "Worker")).toEqual([expect.objectContaining({ id, lastOutputAt })]);
+
+		await probe("finish", id, "done");
+		await manager.getJob(id)?.promise;
+	});
+
 	it("cancels the worker body from main and keeps the shutdown reason a symbol", async () => {
 		const manager = newManager();
 		const probe = await startWorker();

@@ -119,6 +119,7 @@ export class RemoteAsyncJob implements AsyncJob {
 	readonly errorText?: string;
 	readonly structured?: AsyncJob["structured"];
 	readonly progressText?: string;
+	readonly lastOutputAt?: number;
 	readonly latestDetails?: AsyncJobDetails;
 	readonly ownerId?: string;
 	readonly agentId?: string;
@@ -143,6 +144,7 @@ export class RemoteAsyncJob implements AsyncJob {
 		this.errorText = wire.errorText;
 		this.structured = wire.structured;
 		this.progressText = wire.progressText;
+		this.lastOutputAt = wire.lastOutputAt;
 		this.latestDetails = wire.latestDetails;
 		this.ownerId = wire.ownerId;
 		this.agentId = wire.agentId;
