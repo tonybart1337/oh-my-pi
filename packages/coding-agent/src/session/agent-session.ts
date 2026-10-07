@@ -10307,6 +10307,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			openPlanReview: async () => false,
 			getContextUsage: () => this.getContextUsage(),
 			getAsyncJobSnapshot: () => this.getAsyncJobSnapshot(),
+			inspectAsyncJob: id => this.inspectAsyncJob(id),
 			waitForIdle: () => this.waitForIdle(),
 			newSession: async options => {
 				const success = await this.newSession({ parentSession: options?.parentSession });

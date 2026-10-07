@@ -9,6 +9,7 @@ import { runEvalWait } from "../../src/eval/handle-bridge";
 import type { JsStatusEvent } from "../../src/eval/js/shared/types";
 import { TextTap } from "../../src/job-widgets/text-tap";
 import type { ArtifactManagerApi } from "../../src/session/artifacts";
+import { asyncJobSnapshot } from "../../src/session/async-job-views";
 import { CostCapError, type CostGateApi } from "../../src/session/cost-gate";
 import type { SubagentMainApi, SubagentWorkerApi, WorkerThreadLink } from "../../src/thread/protocol";
 import { type RpcFrame, RpcLink } from "../../src/thread/rpc";
@@ -170,6 +171,8 @@ const probe: RuntimeProbe = async (op, ...args) => {
 			const job = manager(args[0]).getJob(String(args[1]));
 			return { hasWidgetInputs: job?.widgetInputs !== undefined, pids: job?.process?.pids() ?? null };
 		}
+		case "snapshot":
+			return asyncJobSnapshot(manager(args[0]), String(args[1])).running;
 		case "cancelAllShutdown":
 			manager(args[0]).cancelAll(undefined, ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
 			return true;

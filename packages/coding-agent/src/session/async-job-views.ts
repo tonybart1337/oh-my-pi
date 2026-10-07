@@ -23,6 +23,7 @@ function jobSnapshotItem(job: AsyncJob, widgets: JobWidgetRegistry | undefined):
 		command: job.process?.command,
 		startTime: job.startTime,
 		endTime: job.endTime,
+		lastOutputAt: job.lastOutputAt,
 		agentId: job.agentId,
 		ownerId: job.ownerId,
 	};
