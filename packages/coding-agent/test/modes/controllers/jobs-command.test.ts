@@ -280,4 +280,42 @@ describe("/jobs in the native terminal", () => {
 			for (const ref of refs) registry.unregister(ref.id, ref);
 		}
 	});
+
+	it("carries each job's lastOutputAt on snapshot rows and on tree rows of a subagent's jobs", async () => {
+		const registry = AgentRegistry.global();
+		const ref = registry.register({ id: "Worker", displayName: "task", kind: "sub", parentId: "main", session: null });
+		const now = vi.spyOn(Date, "now").mockReturnValue(4_000);
+		const gates = [Promise.withResolvers<string>(), Promise.withResolvers<string>()];
+		const reported = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+		const owners = ["main", "Worker"] as const;
+		const ids = owners.map((ownerId, i) =>
+			manager.register(
+				"bash",
+				`${ownerId} build`,
+				async ({ reportProgress }) => {
+					await reportProgress(`${ownerId} compiling`);
+					reported[i].resolve();
+					return gates[i].promise;
+				},
+				{ ownerId },
+			),
+		);
+		try {
+			await Promise.all(reported.map(r => r.promise));
+			now.mockReturnValue(9_000);
+			expect(session.getAsyncJobSnapshot()?.running).toEqual([
+				expect.objectContaining({ id: ids[0], lastOutputAt: 4_000 }),
+			]);
+			const tree = session.getAsyncJobTree();
+			expect(tree?.running).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({ id: ids[0], lastOutputAt: 4_000 }),
+					expect.objectContaining({ id: ids[1], ownerId: "Worker", lastOutputAt: 4_000 }),
+				]),
+			);
+		} finally {
+			for (const gate of gates) gate.resolve("done");
+			registry.unregister(ref.id, ref);
+		}
+	});
 });
