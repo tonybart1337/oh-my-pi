@@ -83,7 +83,11 @@ import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import type { NativeToolView } from "@oh-my-pi/pi-tui/tools/renderer";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
-import type { EphemeralTurnOptions, EphemeralTurnResult } from "../../session/agent-session-types";
+import type {
+	AsyncJobInspection,
+	EphemeralTurnOptions,
+	EphemeralTurnResult,
+} from "../../session/agent-session-types";
 import type { CompactMode } from "../../session/compact-modes";
 import type { CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
@@ -491,6 +495,11 @@ export interface ExtensionContext {
 	getContextUsage(): ContextUsage | undefined;
 	/** Get a read-only snapshot of async jobs owned by this session. */
 	getAsyncJobSnapshot(): AsyncJobSnapshot | null;
+	/**
+	 * Inspect one async job this session owns: command, cwd, live pids, exit status, and
+	 * output (the live output tail while running). Undefined for unknown or foreign jobs.
+	 */
+	inspectAsyncJob(id: string): AsyncJobInspection | undefined;
 	/** Compact the session context (interactive mode shows UI). */
 	compact(instructionsOrOptions?: string | CompactOptions): Promise<void>;
 	/** Whether UI is available (false in print/RPC mode) */

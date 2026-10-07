@@ -2836,6 +2836,7 @@ export class AgentSession implements SettingsScope {
 			label: job.label,
 			command: job.process?.command,
 			startTime: job.startTime,
+			lastOutputAt: job.lastOutputAt,
 			agentId: job.agentId,
 		}));
 		const recent = manager.getRecentJobs(options?.recentLimit ?? 5, ownerFilter).map(job => ({
@@ -2846,6 +2847,7 @@ export class AgentSession implements SettingsScope {
 			command: job.process?.command,
 			startTime: job.startTime,
 			endTime: job.endTime,
+			lastOutputAt: job.lastOutputAt,
 			agentId: job.agentId,
 		}));
 		const delivery = manager.getDeliveryState(ownerFilter);
@@ -8061,6 +8063,7 @@ export class AgentSession implements SettingsScope {
 			},
 			getContextUsage: () => this.getContextUsage(),
 			getAsyncJobSnapshot: () => this.getAsyncJobSnapshot(),
+			inspectAsyncJob: id => this.inspectAsyncJob(id),
 			waitForIdle: () => this.waitForIdle(),
 			newSession: async options => {
 				const success = await this.newSession({ parentSession: options?.parentSession });

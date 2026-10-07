@@ -64,6 +64,31 @@ describe("AsyncJobManager", () => {
 		expect(manager.getJob(jobId)?.status).toBe("completed");
 	});
 
+	test("advances lastOutputAt only when the reported text changes", async () => {
+		// A hung job that re-reports its last progress line must not look like it produced output.
+		const now = vi.spyOn(Date, "now");
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const step = Promise.withResolvers<void>();
+		const reported = Promise.withResolvers<void>();
+		const jobId = manager.register("bash", "build", async ({ reportProgress }) => {
+			now.mockReturnValue(1_000);
+			await reportProgress("compiling 1/2");
+			now.mockReturnValue(5_000);
+			await reportProgress("compiling 1/2");
+			reported.resolve();
+			await step.promise;
+			now.mockReturnValue(9_000);
+			await reportProgress("compiling 2/2");
+			return "done";
+		});
+
+		await reported.promise;
+		expect(manager.getJob(jobId)?.lastOutputAt).toBe(1_000);
+		step.resolve();
+		await manager.waitForAll();
+		expect(manager.getJob(jobId)?.lastOutputAt).toBe(9_000);
+	});
+
 	test("swallows progress callback errors without failing the job", async () => {
 		const completions: Array<{ jobId: string; text: string }> = [];
 		const manager = new AsyncJobManager({

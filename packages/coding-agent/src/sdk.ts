@@ -3303,6 +3303,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				depth: taskDepth,
 				...(options.parentAgentId ? { parentId: options.parentAgentId } : {}),
 			}),
+			id => (hasSession ? session.inspectAsyncJob(id) : undefined),
 		);
 
 		credentialDisabledTarget = extensionRunner;
