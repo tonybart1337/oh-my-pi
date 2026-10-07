@@ -488,6 +488,7 @@ function jobSnapshotItem(job: AsyncJob): AsyncJobSnapshotItem {
 		command: job.process?.command,
 		startTime: job.startTime,
 		endTime: job.endTime,
+		lastOutputAt: job.lastOutputAt,
 		agentId: job.agentId,
 		ownerId: job.ownerId,
 	};
@@ -8701,6 +8702,7 @@ export class AgentSession implements SettingsScope {
 			openPlanReview: async () => false,
 			getContextUsage: () => this.getContextUsage(),
 			getAsyncJobSnapshot: () => this.getAsyncJobSnapshot(),
+			inspectAsyncJob: id => this.inspectAsyncJob(id),
 			waitForIdle: () => this.waitForIdle(),
 			newSession: async options => {
 				const success = await this.newSession({ parentSession: options?.parentSession });
