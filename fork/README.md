@@ -16,8 +16,17 @@ The stock `omp` is left alone; switching to the fork is a separate, manual decis
 upstream's updater never replaces the patched binary.
 
 Failures (rebase conflict, failed gate, failed build) leave the installed binary and
-the branch untouched and notify via `agent-notify` (Telegram). A conflict needs a
-manual rebase in the `tony/stable` worktree; then run `omp-fork install`.
+the branch untouched and notify via `agent-notify` (Telegram).
+
+A rebase conflict starts a headless agent (`agent run -p personal omp --auto-approve -p
+<prompt>`) in the transient user unit `omp-fork-resolve`; the timer run exits at once.
+The agent redoes the rebase on a detached HEAD, resolves the conflicts, runs the gates,
+and finishes with `omp-fork update`. When the unit ends, `omp-fork resolve` checks the
+repo itself (on `tony/stable`, clean, on the target tag, that build installed) and
+notifies success or failure. While the unit is active, other `update`/`install` runs
+skip. Each target tag gets one attempt (`~/.local/state/omp-fork/resolve-target`);
+after a failed one, rebase by hand in the `tony/stable` worktree, then run
+`omp-fork update`. The agent's final summary lands in `journalctl --user -u omp-fork-resolve`.
 
 Native addons come prebuilt from npm (`@oh-my-pi/pi-natives-linux-x64@<version>`);
 they are compiled locally only when the patches touch `crates/` or `packages/natives`.
