@@ -30,6 +30,7 @@ import { Memo } from "../native/memo";
 import { DEFAULT_SPINNER_INTERVAL_MS, spinnerAnimated, spinnerInterval } from "../spinner-clock";
 import { EMPTY_LINK_TARGETS, resolveImageOptions } from "../render/render-utils";
 import { WidthAwareText } from "../render";
+import { imageOpenCaption } from "./image-link";
 import { cachedPngConversion, convertImageToPngShared, imagePayloadKey } from "./image-loading";
 import { canonicalizeMessage, formatThinkingForDisplay, hasDisplayableThinking } from "./thinking-display";
 import { resolveAssistantErrorPresentation } from "./transcript-render-helpers";
@@ -1765,6 +1766,8 @@ export class AssistantMessageComponent extends Container {
 						},
 					),
 				);
+				const caption = imageOpenCaption(image, text => theme.fg("muted", text));
+				if (caption) this.#contentContainer.addChild(caption);
 				continue;
 			}
 			this.#contentContainer.addChild(
