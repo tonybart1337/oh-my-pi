@@ -1,14 +1,16 @@
 /**
  * Pieces the write and edit looks share: the LSP diagnostics tree, the
  * numbered code preview (gutter rows wrap under their code), file paths and
- * the OSC 8 links every tool look draws on them, and which result images a
- * card draws as pictures.
+ * the OSC 8 links every tool look draws on them, which result images a
+ * card draws as pictures, and the "open" captions under drawn pictures.
  */
 import type { UiNode } from "@oh-my-pi/pi-tui";
 import { terminalIdentity } from "@oh-my-pi/pi-tui/driver/session";
+import { getBlob } from "@oh-my-pi/pi-tui/native/blobs";
 import { type PaintContext, roleOf } from "@oh-my-pi/pi-tui/term/paint";
 import { hyperlink } from "@oh-my-pi/pi-tui/text/osc";
-import { visibleWidth, wrap } from "@oh-my-pi/pi-tui/text/width";
+import { truncate, visibleWidth, wrap } from "@oh-my-pi/pi-tui/text/width";
+import type { TspImageProps } from "@oh-my-pi/pi-wire";
 import type { Theme } from "@oh-my-pi/pi-tui/theme/contract";
 import { diagnosticOrder, type FileDiagnostics, type ParsedDiagnostic, parseDiagnostic } from "../../tools/file-common";
 import { fileUriForTerminal } from "../../../utils/file-links";
@@ -50,6 +52,26 @@ export function imageLink(
 	source?: string,
 ): string {
 	return cx.hyperlinks ? fileLink(cx, text, imageLinkTarget(blob, source)) : text;
+}
+
+/**
+ * The `↗ open WxH fmt` caption a drawn picture gets on its own row, linked
+ * (OSC 8) to the file the image opens (see {@link imageLink}): terminal
+ * graphics paint over cells, so the picture itself cannot carry the link.
+ * Undefined on a terminal without links, or when there is no file to open.
+ */
+export function imageOpenCaption(
+	cx: Pick<PaintContext, "hyperlinks" | "theme" | "width">,
+	image: UiNode,
+	source?: string,
+): string | undefined {
+	if (!cx.hyperlinks) return undefined;
+	const { blob, w, h } = image.props() as TspImageProps;
+	const target = imageLinkTarget(blob, source);
+	if (!target) return undefined;
+	const format = (blob ? getBlob(blob)?.mime : undefined)?.replace(/^image\//u, "") ?? "image";
+	const label = truncate(`↗ open ${w && h ? `${w}×${h} ` : ""}${format}`, Math.max(1, cx.width - 1));
+	return fileLink(cx, cx.theme.fg("muted", label), target);
 }
 
 /**

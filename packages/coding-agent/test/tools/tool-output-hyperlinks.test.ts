@@ -8,12 +8,15 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
-import { signal } from "@oh-my-pi/pi-tui";
+import { createRoot, type JSXNode, resolveChildren, signal } from "@oh-my-pi/pi-tui";
+import { type PaintImages, staticEnvironment } from "@oh-my-pi/pi-tui/term/paint";
+import { renderBlock } from "@oh-my-pi/pi-tui/term/render";
 import "../../src/ui/styles/figures";
 import "../../src/ui/styles/messages";
 import "../../src/ui/styles/transcript/exec-run";
 import "../../src/ui/styles/transcript/read-group";
 import { printRows } from "../../src/ui/print-rows";
+import { ensureTheme } from "../../src/ui/theme/service";
 import { lspPresenter } from "../../src/ui/tools/lsp";
 import { ExecRun, ExecRunBlock } from "../../src/ui/transcript/exec-run";
 import { EmbedFigure } from "../../src/ui/transcript/figures";
@@ -512,6 +515,103 @@ describe("image placeholder OSC 8 links", () => {
 			80,
 			{ hyperlinks: true },
 		).join("\n");
+		expect(extractLinkUris(rows)).toContain(fileUri(blobPath));
+	});
+});
+
+describe("drawn image open captions", () => {
+	const blobPath = path.join(PROJECT, "blobs/drawn.png");
+	let disposeWriter: (() => void) | undefined;
+	beforeAll(() => {
+		disposeWriter = setImageBlobWriter(() => ({ displayPath: blobPath }));
+	});
+	afterAll(() => disposeWriter?.());
+
+	const image = { type: "image", data: TINY_PNG_BASE64, mimeType: "image/png" };
+	const caption = "↗ open 1×1 png";
+
+	/** Rows of `view` on a terminal that draws images (every picture `state`, default drawn). */
+	function drawnRows(
+		view: () => JSXNode,
+		options: { hyperlinks?: boolean; state?: "image" | "fallback" } = {},
+	): string {
+		ensureTheme();
+		const state = options.state ?? "image";
+		const images: PaintImages = {
+			rows: (_source, request) => ({
+				rows: state === "image" ? ["<picture>"] : [request.fallback ?? ""],
+				columns: 9,
+				state,
+			}),
+			cell: () => ({ w: 10, h: 20 }),
+		};
+		const env = staticEnvironment(currentTheme(), { hyperlinks: options.hyperlinks ?? true, images });
+		return createRoot(dispose => {
+			try {
+				return resolveChildren(view)()
+					.flatMap(node => renderBlock(node, 120, { env }).rows)
+					.join("\n");
+			} finally {
+				dispose();
+			}
+		});
+	}
+
+	function toolRows(details: unknown, options?: { hyperlinks?: boolean; state?: "image" | "fallback" }): string {
+		const call = toolCall({
+			name: "custom_tool",
+			args: {},
+			result: { content: [{ type: "text", text: "done" }, image], details } as never,
+			expanded: true,
+		});
+		return drawnRows(() => ToolBlock({ call }), options);
+	}
+
+	it("captions a drawn tool result image with a link to its blob copy, or to the file it was read from", () => {
+		const rows = toolRows(undefined);
+		expect(rows).toContain("<picture>");
+		expect(rows).toContain(caption);
+		expect(extractLinkUris(rows)).toContain(fileUri(blobPath));
+		const media = path.join(PROJECT, "drawn-shot.png");
+		expect(extractLinkUris(toolRows({ mediaPath: media }))).toContain(fileUri(media));
+	});
+
+	it("adds no caption on a terminal without links, nor under a picture it could not draw", () => {
+		expect(toolRows(undefined, { hyperlinks: false })).not.toContain(caption);
+		expect(toolRows(undefined, { state: "fallback" })).not.toContain(caption);
+	});
+
+	it("captions a user run's drawn image", () => {
+		const run = new ExecRun({ kind: "bash", source: "shot", excluded: false, now: () => 0 });
+		run.setComplete(0, false, { images: [image], showImages: true });
+		const rows = drawnRows(() => ExecRunBlock({ run }));
+		expect(rows).toContain(caption);
+		expect(extractLinkUris(rows)).toContain(fileUri(blobPath));
+	});
+
+	it("captions an assistant's drawn image", () => {
+		const message = {
+			role: "assistant",
+			content: [{ type: "text", text: "Here:" }, image],
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			provider: "p",
+			model: "m",
+			api: "x",
+			timestamp: 0,
+		} as never;
+		const rows = drawnRows(() =>
+			AssistantMessageBlock({ model: { message: signal(message), finalized: signal(true), now: () => 0 } }),
+		);
+		expect(rows).toContain("<picture>");
+		expect(rows).toContain(caption);
 		expect(extractLinkUris(rows)).toContain(fileUri(blobPath));
 	});
 });

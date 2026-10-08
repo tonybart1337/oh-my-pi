@@ -11,18 +11,18 @@
  * - Otherwise the tool's look, set off by a blank row above and below when
  *   the look is framed.
  * - Under the look, the result's images where the terminal draws images
- *   (while images are on), each after a blank row; the look leaves their
- *   placeholders out.
+ *   (while images are on), each after a blank row and with an "open" caption
+ *   linking its file; the look leaves their placeholders out.
  */
 import type { UiNode } from "@oh-my-pi/pi-tui";
 import { type Block, defineRolePainter, EMPTY_BLOCK, type PaintContext } from "@oh-my-pi/pi-tui/term/paint";
 import { styledText } from "@oh-my-pi/pi-tui/term/painters/layout";
 import { truncate } from "@oh-my-pi/pi-tui/text/width";
 import { SPINNER_INTERVAL_MS } from "@oh-my-pi/pi-tui/term/painters/spinner";
-import { imageLabel, paintImage } from "@oh-my-pi/pi-tui/term/painters/image";
+import { imageLabel, imageRows } from "@oh-my-pi/pi-tui/term/painters/image";
 import { terminalPaddingX } from "../terminal-padding";
 import { tint, tintRow } from "./default";
-import { imageLink, resultPictures } from "./file-common";
+import { imageLink, imageOpenCaption, resultPictures } from "./file-common";
 import { lookFor, type ToolProps, toolProps } from "./look";
 
 /** `cx` with some fields replaced (its getters keep reading the paint environment). */
@@ -48,16 +48,23 @@ export function paintToolLook(node: UiNode, cx: PaintContext): Block {
 	return linkImagePlaceholders(node, cx, withPictures(node, cx, lookFor(node).paint(node, cx)));
 }
 
-/** `block` with the result images it draws as pictures under it (placeholder text where one cannot be drawn). */
+/**
+ * `block` with the result images it draws as pictures under it, each drawn one
+ * captioned with a link to its file (placeholder text where one cannot be drawn).
+ */
 function withPictures(node: UiNode, cx: PaintContext, block: Block): Block {
 	const pictures = resultPictures(node, cx);
 	if (pictures.length === 0) return block;
 	const links = toolProps(node).term?.imageLinks;
 	const rows = [...block.rows];
 	pictures.forEach((picture, i) => {
-		const text = links?.[i]?.text;
-		const label = text ? cx.theme.fg("toolOutput", text) : imageLabel(picture, cx);
-		rows.push("", ...paintImage(picture, cx, label).rows);
+		const link = links?.[i];
+		const label = link?.text ? cx.theme.fg("toolOutput", link.text) : imageLabel(picture, cx);
+		const drawn = imageRows(picture, cx, label);
+		rows.push("", ...(drawn?.rows ?? [truncate(label, cx.width)]));
+		if (!drawn || drawn.state === "fallback") return;
+		const caption = imageOpenCaption(cx, picture, link?.source);
+		if (caption) rows.push(` ${caption}`);
 	});
 	return { ...block, rows };
 }

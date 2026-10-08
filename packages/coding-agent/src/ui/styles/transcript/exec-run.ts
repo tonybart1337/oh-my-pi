@@ -3,7 +3,8 @@
  * `omp.eval`): between two full-width rules in the run's mode color (dim
  * when excluded from context), the bold `$ command` or `>>> code` prompt,
  * a blank row and the output's tail (20 rows collapsed), then inline pictures
- * (or their linked placeholders). Once settled, the hidden-row count and notices.
+ * (each with an "open" caption linking its file, or their linked placeholders).
+ * Once settled, the hidden-row count and notices.
  * The bottom rule carries the spinner and cancel hint while running, then the
  * exit code or `cancelled`.
  *
@@ -20,7 +21,7 @@ import { appInterruptKeys } from "../../../config/keybindings/matchers";
 import { terminalPaddingX } from "../terminal-padding";
 import { expandKeyLabel, keyLabel } from "../../keys/hints";
 import type { ExecRunTerm } from "../../transcript/exec-run";
-import { imageLink } from "../tools/file-common";
+import { imageLink, imageOpenCaption } from "../tools/file-common";
 import { toolProps } from "../tools/look";
 
 /** Output rows a collapsed run shows. */
@@ -71,8 +72,12 @@ function paintExecRun(node: UiNode, cx: PaintContext): Block {
 		const label = theme.fg("muted", image);
 		const picture = pictures[index];
 		const drawn = picture && imageRows(picture, cx, label);
-		if (drawn && drawn.state !== "fallback") rows.push(...drawn.rows);
-		else rows.push(...padded(imageLink(cx, label, term.imageBlobs?.[index])));
+		if (drawn && drawn.state !== "fallback") {
+			rows.push(...drawn.rows);
+			// A drawn picture cannot carry a link; its caption opens the file instead.
+			const caption = imageOpenCaption(cx, picture);
+			if (caption) rows.push(...padded(caption));
+		} else rows.push(...padded(imageLink(cx, label, term.imageBlobs?.[index])));
 	});
 	if (!running) {
 		const parts: string[] = [];

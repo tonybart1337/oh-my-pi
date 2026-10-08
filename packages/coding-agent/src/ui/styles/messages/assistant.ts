@@ -9,9 +9,9 @@
  *   by a blank row. Hidden thinking draws nothing; while it streams, a
  *   pulsing `✻ Thinking` line (with tokens and speed when known) follows
  *   the reply.
- * - Images: drawn one cell in where the terminal draws images, else
- *   `[Image: mime]` in `toolOutput`; after a blank row (tool-result images
- *   share one).
+ * - Images: drawn one cell in where the terminal draws images, each drawn one
+ *   with an "open" caption linking its file, else `[Image: mime]` in
+ *   `toolOutput`; after a blank row (tool-result images share one).
  * - The turn-ending error: `Error: …` wrapped under a hanging indent, capped
  *   at 8 rows with a `… +N more lines` expansion hint while collapsed
  *   (hidden while the same error is pinned and collapsed); the abort label;
@@ -22,7 +22,7 @@
  */
 import type { UiNode } from "@oh-my-pi/pi-tui";
 import { type Block, defineRolePainter, type Hit, type PaintContext } from "@oh-my-pi/pi-tui/term/paint";
-import { paintImage } from "@oh-my-pi/pi-tui/term/painters/image";
+import { imageRows as pictureRows } from "@oh-my-pi/pi-tui/term/painters/image";
 import { routedLinkSchemes } from "@oh-my-pi/pi-tui/term/painters/md";
 import {
 	type MarkdownLook,
@@ -30,13 +30,13 @@ import {
 	renderMarkdownFrame,
 	takeExtensionLinks,
 } from "@oh-my-pi/pi-tui/text/markdown/index";
-import { replaceTabs, wrap } from "@oh-my-pi/pi-tui/text/width";
+import { replaceTabs, truncate, wrap } from "@oh-my-pi/pi-tui/text/width";
 import type { Theme } from "@oh-my-pi/pi-tui/theme/contract";
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import { terminalPaddingX } from "../terminal-padding";
 import { expandKeyLabel } from "../../keys/hints";
 import { hexFg, paddedText, propsOf, termOf } from "./fill";
-import { imageLink } from "../tools/file-common";
+import { imageLink, imageOpenCaption } from "../tools/file-common";
 
 /** Facets of the hidden-thinking pulse. */
 const PULSE_FRAMES = ["✻", "✼", "❉", "❊", "✺", "✹", "✸", "✶"] as const;
@@ -205,7 +205,12 @@ function imageRows(cx: PaintContext, image: UiNode): readonly string[] {
 	if (!cx.images)
 		return [`${" ".repeat(terminalPaddingX())}${imageLink(cx, label, propsOf<{ blob?: string }>(image).blob)}`];
 	const inner = Object.create(cx, { width: { value: Math.max(1, cx.width - 1), enumerable: true } }) as PaintContext;
-	return paintImage(image, inner, label).rows.map(row => ` ${row}`);
+	const drawn = pictureRows(image, inner, label);
+	const rows = (drawn?.rows ?? [truncate(label, inner.width)]).map(row => ` ${row}`);
+	// A drawn picture cannot carry a link; its caption opens the file instead.
+	const caption = drawn && drawn.state !== "fallback" ? imageOpenCaption(inner, image) : undefined;
+	if (caption) rows.push(` ${caption}`);
+	return rows;
 }
 
 function paintAssistant(node: UiNode, cx: PaintContext): Block {
