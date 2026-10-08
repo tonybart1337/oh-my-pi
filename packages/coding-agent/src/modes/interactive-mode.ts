@@ -244,6 +244,7 @@ import {
 } from "../vibe/runtime";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import { setSvgFigureRendering } from "@oh-my-pi/pi-tui/chat/svg-figure";
+import { setTranscriptImageLinkWriter } from "@oh-my-pi/pi-tui/chat/image-link";
 import { setTableCharts } from "@oh-my-pi/pi-tui/chat/table-chart";
 import { setTranscriptActionHandler } from "@oh-my-pi/pi-tui/chat/transcript-actions";
 import { StatusNotice } from "@oh-my-pi/pi-tui/chrome/status-notice";
@@ -2093,6 +2094,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingSlashCommands = this.#buildPendingSlashCommands();
 
 		this.#uiHelpers = new UiHelpers(this);
+		// Transcript images get an "open" caption linking a typed blob copy (global blob store, so idempotent).
+		setTranscriptImageLinkWriter((data, options) => this.sessionManager.putBlobSync(data, options));
 		this.#btwController = new BtwController(this);
 		this.#tanCommandController = new TanCommandController(this);
 		this.#omfgController = new OmfgController(this);
@@ -7194,6 +7197,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// mutex deny on arrival instead of prompting a torn-down UI. `init`
 		// installs a fresh one.
 		this.#dialogLifetime.abort();
+		setTranscriptImageLinkWriter(undefined);
 		this.#streamPublisher?.dispose();
 		this.#streamPublisher = undefined;
 		void this.#recorder?.stop();
