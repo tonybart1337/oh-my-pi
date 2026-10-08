@@ -103,6 +103,22 @@ describe("detectTerminalId", () => {
 		expect(getTerminalInfo(id).notifyProtocol).toBe(NotifyProtocol.Osc9);
 	});
 
+	it("recognizes Konsole by KONSOLE_VERSION and uses full-colour Kitty graphics instead of the SIXEL probe", () => {
+		const id = detectTerminalId({ TERM: "xterm-256color", COLORTERM: "truecolor", KONSOLE_VERSION: "260801" });
+		expect(id).toBe("konsole");
+		expect(getTerminalInfo(id).imageProtocol).toBe(ImageProtocol.Kitty);
+	});
+
+	it("does not trust a KONSOLE_VERSION leaked into a tmux pane", () => {
+		const env = {
+			TERM: "tmux-256color",
+			TMUX: "/tmp/tmux-1000/default,1,0",
+			COLORTERM: "truecolor",
+			KONSOLE_VERSION: "260801",
+		};
+		expect(detectTerminalId(env)).not.toBe("konsole");
+	});
+
 	it("falls back to trueColor on VTE/Ptyxis environments — VTE OSC 9 is ConEmu progress, not a notification protocol", () => {
 		const env = { TERM: "xterm-256color", TERM_PROGRAM: "", COLORTERM: "truecolor", VTE_VERSION: "8400" };
 

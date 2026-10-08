@@ -42,6 +42,7 @@ export type TerminalId =
 	| "rio"
 	| "tern"
 	| "monstar"
+	| "konsole"
 	| "base"
 	| "trueColor";
 
@@ -729,6 +730,13 @@ const KNOWN_TERMINALS = Object.freeze({
 	// activating it focuses the Monstar window. The BEL path uses omp's own
 	// `notify-send` fallback instead, which cannot focus a window.
 	monstar: new TerminalInfo("monstar", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc9, false, false, false, 2),
+	// Konsole (KDE) exports KONSOLE_VERSION. Since 22.04 it renders Kitty graphics
+	// direct placement (`a=T`/`a=p`, PNG) at full colour — no Unicode placeholders,
+	// so detectKittyUnicodePlaceholdersSupport keeps it on direct placement. Without
+	// this entry the SIXEL probe wins and images are dithered to 256 colours.
+	// OSC 8 links are parsed and shown only when the profile enables
+	// "Allow escape sequences for links"; otherwise the plain text renders.
+	konsole: new TerminalInfo("konsole", ImageProtocol.Kitty, true, true),
 });
 
 /** Resolve terminal identity from environment markers used by common emulators. */
@@ -764,6 +772,7 @@ export function detectTerminalId(env: NodeJS.ProcessEnv = Bun.env): TerminalId {
 		TERM_PROGRAM,
 		TERM,
 		COLORTERM,
+		KONSOLE_VERSION,
 	} = env;
 
 	if (KITTY_WINDOW_ID) return "kitty";
@@ -783,6 +792,9 @@ export function detectTerminalId(env: NodeJS.ProcessEnv = Bun.env): TerminalId {
 
 	if (TERM?.toLowerCase().includes("ghostty")) return "ghostty";
 	if (TERM && caseEq(TERM, "monstar")) return "monstar";
+	// KONSOLE_VERSION leaks into multiplexer panes, where Kitty graphics need the
+	// multiplexer's own passthrough; leave those to the multiplexer fallback.
+	if (KONSOLE_VERSION && !isInsideTerminalMultiplexer(env)) return "konsole";
 
 	if (COLORTERM) {
 		if (caseEq(COLORTERM, "truecolor") || caseEq(COLORTERM, "24bit")) return "trueColor";
