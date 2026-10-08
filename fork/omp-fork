@@ -7,10 +7,13 @@
 #   omp-fork install  rebuild and install the branch as it is (no fetch, no rebase)
 #   omp-fork status   installed build, patch series, newest upstream release
 #   omp-fork setup    install this script and the omp-fork systemd user timer
+#   omp-fork resolve TAG  (internal) run the conflict-resolving agent for TAG
 #
 # The rebase runs on a detached HEAD; the branch only moves after the new binary
 # built, passed its gates, and is installed. Any failure leaves the installed build
-# and the branch untouched and sends a notification.
+# and the branch untouched and sends a notification. A rebase conflict also starts
+# an agent (once per target tag) in the transient unit omp-fork-resolve to redo the
+# rebase by hand and finish with `omp-fork update`.
 set -euo pipefail
 
 REPO="${OMP_FORK_REPO:-$HOME/projects/open-source/.worktrees/oh-my-pi_fork-stable}"
@@ -22,6 +25,9 @@ BIN="${OMP_FORK_BIN:-$HOME/.local/bin/omp-dev}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omp-fork"
 NOTIFY_TO="${OMP_FORK_NOTIFY_TO:-195550206}"
 KEEP_BUILDS=3
+RESOLVE_UNIT=omp-fork-resolve
+# Headless agent that resolves rebase conflicts; the prompt is appended.
+RESOLVER=(agent run -p personal omp --auto-approve -p)
 
 log() { printf 'omp-fork: %s\n' "$*" >&2; }
 
@@ -155,7 +161,8 @@ cmd_update() {
 		if ! git_ rebase -q --empty=drop --onto "$target" "$base"; then
 			git_ rebase --abort || true
 			git_ checkout -q "$BRANCH"
-			die "rebasing the patches onto $target conflicts; resolve by hand in $REPO (still running $(installed_build))"
+			start_resolver "$target"
+			exit 1
 		fi
 	fi
 
@@ -169,6 +176,57 @@ cmd_update() {
 		notify "installed omp $id ($target + $(git_ rev-list --count "$target..$BRANCH") patches)"
 	else
 		log "installed omp $id"
+	fi
+}
+
+# Hands a conflicting rebase to an agent in a transient unit, so this run (and its
+# lock, which the agent's own `omp-fork update` needs) ends right away. Attempts
+# each target tag once: a failed attempt waits for a human or a newer tag.
+start_resolver() {
+	local target=$1 marker="$STATE_DIR/resolve-target" args=() var
+	if [[ "$(cat "$marker" 2>/dev/null)" == "$target" ]]; then
+		die "rebasing the patches onto $target conflicts and the agent already tried; resolve by hand in $REPO (still running $(installed_build))"
+	fi
+	printf '%s\n' "$target" >"$marker"
+	for var in PATH XDG_STATE_HOME ${!OMP_FORK_@}; do
+		[[ -n "${!var:-}" ]] && args+=("--setenv=$var=${!var}")
+	done
+	if systemd-run --user --quiet --collect --unit="$RESOLVE_UNIT" --property=RuntimeMaxSec=2h \
+		--property=Nice=10 "${args[@]}" -- "$(readlink -f "$0")" resolve "$target"; then
+		notify "rebasing the patches onto $target conflicts; an agent is resolving it (journalctl --user -u $RESOLVE_UNIT); still running $(installed_build)"
+	else
+		rm -f "$marker"
+		die "rebasing the patches onto $target conflicts and the agent could not start; resolve by hand in $REPO (still running $(installed_build))"
+	fi
+}
+
+resolve_prompt() {
+	local target=$1 base
+	base=$(base_tag "$BRANCH")
+	cat <<-EOF
+	omp-fork (our omp fork updater, script $REPO/fork/omp-fork, docs $REPO/fork/README.md) failed to rebase branch $BRANCH from $base onto upstream release $target: the rebase conflicts. Read memory/omp-fork.md first. Resolve it end to end, unattended:
+
+	1. In $REPO, on a detached HEAD exactly like the script: git checkout --detach $BRANCH && git rebase --empty=drop --onto $target $base
+	2. Resolve every conflict by understanding what upstream changed (git log/diff $base..$target on the conflicting files) and what our patch intends. Keep upstream's design and re-express our patch on top of it; never drop a patch's behavior to get a clean merge. Where upstream changed an API our patch relies on, adapt both call sites and tests, and add a test when our behavior now travels a new code path.
+	3. After each resolved commit, and at the end: cd packages/coding-agent && bun run check:types && bun test test/collab. All must pass.
+	4. Finish with: git checkout -B $BRANCH && omp-fork update. That builds, installs, and pushes; it must log "installed omp".
+	5. If upstream changed the fork in a way future rebases should know, add a short dated line to memory/omp-fork.md.
+
+	If you cannot resolve it correctly, run git rebase --abort && git checkout $BRANCH in $REPO so the worktree is clean, and explain why. End your reply with a summary of each conflict and how you resolved it.
+	EOF
+}
+
+# Runs inside $RESOLVE_UNIT; reports the outcome from the repo state, not the agent's word.
+cmd_resolve() {
+	local target=${1:?usage: omp-fork resolve TAG} status=0 expected
+	export OMP_FORK_RESOLVING=1
+	"${RESOLVER[@]}" "$(resolve_prompt "$target")" || status=$?
+	expected="$(jq -r .version "$REPO/packages/coding-agent/package.json")-$(git_ rev-parse --short=10 "$BRANCH")"
+	if [[ "$(git_ branch --show-current)" == "$BRANCH" && -z "$(git_ status --porcelain --untracked-files=no)" &&
+		"$(base_tag "$BRANCH")" == "$target" && "$(installed_build)" == "$expected" ]]; then
+		notify "the agent rebased onto $target and installed omp $expected ($(git_ rev-list --count "$target..$BRANCH") patches)"
+	else
+		die "the agent did not finish rebasing onto $target (exit $status); resolve by hand in $REPO (journalctl --user -u $RESOLVE_UNIT; still running $(installed_build))"
 	fi
 }
 
@@ -205,12 +263,18 @@ main() {
 	case "$cmd" in
 	update | install)
 		mkdir -p "$STATE_DIR"
+		# While the agent works, the worktree sits mid-rebase; only its own runs may touch it.
+		if [[ -z "${OMP_FORK_RESOLVING:-}" ]] && systemctl --user -q is-active "$RESOLVE_UNIT"; then
+			log "an agent is resolving a rebase conflict ($RESOLVE_UNIT); skipping"
+			exit 0
+		fi
 		exec 9>"$STATE_DIR/lock"
 		flock -n 9 || { log "another omp-fork run holds the lock"; exit 0; }
 		"cmd_$cmd"
 		;;
+	resolve) cmd_resolve "${@:2}" ;;
 	status | setup) "cmd_$cmd" ;;
-	*) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; [[ "$cmd" == help || "$cmd" == -h || "$cmd" == --help ]] ;;
+	*) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; [[ "$cmd" == help || "$cmd" == -h || "$cmd" == --help ]] ;;
 	esac
 }
 
