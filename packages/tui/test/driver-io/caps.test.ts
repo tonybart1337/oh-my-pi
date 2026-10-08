@@ -69,6 +69,25 @@ describe("terminal identity", () => {
 		expect(resolveJamoWidth(detectTerminalId(plain), plain)).toBe("platform");
 		expect(resolveJamoWidth("ghostty", {})).toBe(2);
 	});
+
+	it("recognizes Konsole by KONSOLE_VERSION and uses full-colour Kitty graphics instead of the SIXEL probe", () => {
+		const env = { TERM: "xterm-256color", COLORTERM: "truecolor", KONSOLE_VERSION: "260801" };
+		const id = detectTerminalId(env);
+		expect(id).toBe("konsole");
+		const caps = capabilitiesFromEnv(env, { ...direct, platform: "linux", id });
+		expect(caps.images).toBe("kitty");
+		expect(caps.hyperlinks).toBe(true);
+	});
+
+	it("does not trust a KONSOLE_VERSION leaked into a tmux pane", () => {
+		const env = {
+			TERM: "tmux-256color",
+			TMUX: "/tmp/tmux-1000/default,1,0",
+			COLORTERM: "truecolor",
+			KONSOLE_VERSION: "260801",
+		};
+		expect(detectTerminalId(env)).not.toBe("konsole");
+	});
 });
 
 describe("multiplexers", () => {

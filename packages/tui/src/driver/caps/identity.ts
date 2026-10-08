@@ -42,7 +42,8 @@ export type TerminalId =
 	| "rio"
 	| "rex"
 	| "tern"
-	| "monstar";
+	| "monstar"
+	| "konsole";
 
 function profile(
 	id: TerminalId,
@@ -87,6 +88,13 @@ export const TERMINAL_PROFILES: Readonly<Record<TerminalId, TerminalProfile>> = 
 	tern: profile("tern", "kitty", true, true, true, "osc99"),
 	// Built on libghostty: wide jamo; clears OSC 9;4 progress after 15 s without an update.
 	monstar: profile("monstar", "kitty", true, true, true, "osc9", { jamoWidth: 2, progressKeepalive: true }),
+	// Konsole (KDE) exports KONSOLE_VERSION. Since 22.04 it renders Kitty graphics
+	// direct placement (`a=T`/`a=p`, PNG) at full colour; it has no Unicode
+	// placeholders, so it stays off `kittyPlaceholdersSupported`. Without this
+	// entry the SIXEL probe wins and images are dithered to 256 colours. OSC 8
+	// links render only when the profile enables "Allow escape sequences for
+	// links"; otherwise the plain text shows. Sync output is left to DECRQM.
+	konsole: profile("konsole", "kitty", true, true, false, "bell"),
 };
 
 const PROGRAM_IDS: Readonly<Record<string, TerminalId>> = {
@@ -140,6 +148,9 @@ export function detectTerminalId(env: Env, tmuxClientNames: readonly string[] = 
 	if (term.includes("ghostty")) return "ghostty";
 	if (term === "monstar") return "monstar";
 	if (term === "xterm-rex") return "rex";
+	// KONSOLE_VERSION leaks into multiplexer panes, where Kitty graphics need the
+	// multiplexer's own passthrough; leave those to the multiplexer fallback.
+	if (env.KONSOLE_VERSION && !insideMultiplexer(env)) return "konsole";
 	const colorterm = env.COLORTERM?.toLowerCase();
 	if (colorterm === "truecolor" || colorterm === "24bit") return "trueColor";
 	return "base";
