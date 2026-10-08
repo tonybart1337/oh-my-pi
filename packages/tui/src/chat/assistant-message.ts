@@ -32,6 +32,7 @@ import { DEFAULT_SPINNER_INTERVAL_MS, spinnerAnimated, spinnerInterval } from ".
 import { EMPTY_LINK_TARGETS, resolveImageOptions } from "../render/render-utils";
 import { WidthAwareText } from "../render";
 import { cachedPngConversion, convertImageToPngShared, imagePayloadKey } from "../png-conversion";
+import { imageOpenCaption } from "./image-link";
 import { canonicalizeMessage, formatThinkingForDisplay, hasDisplayableThinking } from "./thinking-display";
 import { resolveAssistantErrorPresentation } from "./transcript-render-helpers";
 import { type CacheInvalidation, CacheInvalidationMarkerComponent } from "./cache-invalidation-marker";
@@ -1970,6 +1971,8 @@ export class AssistantMessageComponent extends Container {
 						},
 					),
 				);
+				const caption = imageOpenCaption(image, text => theme.fg("muted", text));
+				if (caption) this.#contentContainer.addChild(caption);
 				continue;
 			}
 			this.#contentContainer.addChild(

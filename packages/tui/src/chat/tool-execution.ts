@@ -77,6 +77,7 @@ import {
 import type { ToolCommandMountedState } from "../tools/tool-commands";
 import { isFramedBlockComponent, markFramedBlockComponent, renderStatusLine, WidthAwareText } from "../render/index";
 import { cachedPngConversion, convertImageToPngShared, imagePayloadKey } from "../png-conversion";
+import { imageOpenCaption } from "./image-link";
 import { FenceFigure } from "./fence-figure";
 import { SpotlightNotices } from "./spotlight";
 import { sanitizeWithOptionalSixelPassthrough } from "../render/sixel";
@@ -456,7 +457,8 @@ export class ToolExecutionComponent extends Container {
 	#usesContentBox = false;
 	#multiFileBoxes: (Box | Spacer)[] = []; // Extra boxes for multi-file edit results
 	#imageComponents: Image[] = [];
-	#imageSpacers: Spacer[] = [];
+	/** Spacers and "open" captions mounted around result images; removed together on rebuild. */
+	#imageSpacers: (Spacer | Text)[] = [];
 	/** The renderer's {@link ToolRenderer.figure} drawing; kept across rebuilds while its language is unchanged, so it redraws in place and its raster survives them. */
 	#figure: FenceFigure | undefined;
 	readonly #instanceId = ++toolExecutionInstanceSeq;
@@ -2226,6 +2228,11 @@ export class ToolExecutionComponent extends Container {
 					);
 					this.#imageComponents.push(imageComponent);
 					this.addChild(imageComponent);
+					const caption = imageOpenCaption(source, text => theme.fg("muted", text));
+					if (caption) {
+						this.addChild(caption);
+						this.#imageSpacers.push(caption);
+					}
 				}
 			}
 		}
