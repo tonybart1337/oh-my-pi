@@ -48,6 +48,6 @@ if (process.argv[2] === "receive") {
 	const mode = new InteractiveMode(session, "test");
 	mode.ui.requestRender = () => {};
 	mode.ui.terminal.drainInput = async () => {};
-	vi.spyOn(workerClient, "resolveCliEntryCmd").mockReturnValue([process.execPath, import.meta.path, "receive"]);
+	vi.spyOn(workerClient, "resolveRelaunchCmd").mockReturnValue([process.execPath, import.meta.path, "receive"]);
 	await mode.restart();
 }
