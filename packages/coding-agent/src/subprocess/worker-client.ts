@@ -121,12 +121,8 @@ export const SMOKE_TEST_TIMEOUT_MS = 30_000;
 export function resolveExecutablePath(): string {
 	const executable = stripWindowsExtendedLengthPathPrefix(process.execPath);
 	if (isCompiledBinary() && !isExecutable(executable)) {
-		const argv0 = stripWindowsExtendedLengthPathPrefix(process.argv0);
-		const isPath = argv0.includes("/") || argv0.includes("\\") || argv0.includes(":");
 		const candidates = [
-			// Prefer the original launcher when invoked with an absolute path
-			isFullyQualifiedPath(argv0) ? argv0 : null,
-			!isPath ? $which(argv0, { requireAbsolutePaths: true, cache: WhichCachePolicy.Bypass }) : null,
+			resolveLauncherPath(),
 			// Generic fallback to finding "omp" on PATH
 			$which("omp", { requireAbsolutePaths: true, cache: WhichCachePolicy.Bypass }),
 		];
@@ -137,6 +133,33 @@ export function resolveExecutablePath(): string {
 		}
 	}
 	return executable;
+}
+
+/**
+ * The command name this process was launched as, resolved now: an absolute
+ * `argv0` as given, a bare name through PATH. Unlike `process.execPath` this
+ * follows symlinks at lookup time, so a launcher that was re-pointed at a newer
+ * install (`~/.local/bin/omp` → new version dir) resolves to the new binary.
+ */
+function resolveLauncherPath(): string | null {
+	const argv0 = stripWindowsExtendedLengthPathPrefix(process.argv0);
+	if (isFullyQualifiedPath(argv0)) return argv0;
+	const isPath = argv0.includes("/") || argv0.includes("\\") || argv0.includes(":");
+	return isPath ? null : $which(argv0, { requireAbsolutePaths: true, cache: WhichCachePolicy.Bypass });
+}
+
+/**
+ * Command for the TUI `/restart` relaunch. A compiled binary re-runs the command
+ * it was launched as, so a restart picks up an upgrade installed while the
+ * session ran; when that launcher no longer resolves to an executable it falls
+ * back to {@link resolveCliEntryCmd}.
+ */
+export function resolveRelaunchCmd(): string[] {
+	if (isCompiledBinary()) {
+		const launcher = resolveLauncherPath();
+		if (launcher && isExecutable(launcher)) return [launcher];
+	}
+	return resolveCliEntryCmd();
 }
 
 /**
