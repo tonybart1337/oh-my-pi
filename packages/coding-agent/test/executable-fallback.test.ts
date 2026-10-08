@@ -1,7 +1,12 @@
 import * as path from "node:path";
 import * as utils from "@oh-my-pi/pi-utils";
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { resolveCliEntryCmd, resolveExecutablePath, resolveWorkerSpawnCmd } from "../src/subprocess/worker-client";
+import {
+	resolveCliEntryCmd,
+	resolveExecutablePath,
+	resolveRelaunchCmd,
+	resolveWorkerSpawnCmd,
+} from "../src/subprocess/worker-client";
 
 describe("executable fallback on unlinked binary", () => {
 	const originalExecPathDesc = Object.getOwnPropertyDescriptor(process, "execPath");
@@ -36,6 +41,30 @@ describe("executable fallback on unlinked binary", () => {
 			cmd: [process.execPath, "__omp_worker_test"],
 		});
 		expect(whichSpy).not.toHaveBeenCalled();
+	});
+
+	it("/restart relaunches the PATH launcher, not the still-healthy old version binary", () => {
+		// An upgrade re-pointed `omp` while the session ran; the old version dir still exists.
+		vi.spyOn(utils, "isCompiledBinary").mockReturnValue(true);
+		vi.spyOn(utils, "isExecutable").mockReturnValue(true);
+		setProcessProp("execPath", "/home/u/.local/lib/omp-fork/18.8.6-old/omp");
+		setProcessProp("argv0", "omp");
+		vi.spyOn(utils, "$which").mockImplementation((cmd: string) => (cmd === "omp" ? "/home/u/.local/bin/omp" : null));
+
+		expect(resolveRelaunchCmd()).toEqual(["/home/u/.local/bin/omp"]);
+		// Other relaunches (workers) keep the exact running binary.
+		expect(resolveCliEntryCmd()).toEqual(["/home/u/.local/lib/omp-fork/18.8.6-old/omp"]);
+	});
+
+	it("/restart falls back to the running binary when the launcher no longer resolves", () => {
+		vi.spyOn(utils, "isCompiledBinary").mockReturnValue(true);
+		const running = "/home/u/.local/lib/omp-fork/18.8.6-old/omp";
+		setProcessProp("execPath", running);
+		setProcessProp("argv0", "omp");
+		vi.spyOn(utils, "$which").mockReturnValue(null);
+		vi.spyOn(utils, "isExecutable").mockImplementation((p: string) => p === running);
+
+		expect(resolveRelaunchCmd()).toEqual([running]);
 	});
 
 	it("prefers original absolute launcher path over generic PATH match when executable", () => {
