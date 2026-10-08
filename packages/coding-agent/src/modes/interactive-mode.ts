@@ -158,7 +158,7 @@ import { buildStaticInlineHint } from "../slash-commands/builtin-completions";
 import { formatCoarseDuration } from "@oh-my-pi/pi-tui/chrome/format";
 import { type DictationTarget, MicCursor, type SttCallbacks, STTController, type SttState } from "../stt";
 import type { SpaceHoldHandler } from "@oh-my-pi/pi-tui/space-hold";
-import { resolveCliEntryCmd } from "../subprocess/worker-client";
+import { resolveRelaunchCmd } from "../subprocess/worker-client";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-prompt";
 import { labelEchoesHandle } from "../task/label";
 import { agentTypeBadge, formatTaskId } from "@oh-my-pi/pi-tui/tools/task";
@@ -7223,7 +7223,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	/**
 	 * Tear down like {@link shutdown}, then relaunch the CLI with the original
 	 * launch argv (session-source flags and positional prompts stripped, see
-	 * {@link restartArgv}), resuming this session when it exists on disk.
+	 * {@link restartArgv}), resuming this session when it exists on disk. The
+	 * relaunch re-resolves the launch command ({@link resolveRelaunchCmd}), so an
+	 * omp upgraded while this session ran takes over on restart.
 	 *
 	 * On POSIX the relaunch is a true `execvp(3)` image replacement: same PID,
 	 * same terminal, no lingering parent. Postmortem cleanups and stdout are
@@ -7243,7 +7245,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		const sessionFile = this.sessionManager.isSessionOnDisk() ? this.sessionManager.getSessionFile() : undefined;
 		const cmd = [
-			...resolveCliEntryCmd(),
+			...resolveRelaunchCmd(),
 			...restartArgv(process.argv.slice(2), sessionFile ? path.resolve(sessionFile) : undefined),
 		];
 		await postmortem.cleanup();
