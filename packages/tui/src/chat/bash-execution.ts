@@ -11,6 +11,7 @@ import { Container, type TUI } from "../tui";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import type { Terminal as XtermTerminalType } from "@oh-my-pi/pi-utils/vterm";
 import { theme } from "../theme/theme";
+import { imageOpenCaption } from "./image-link";
 import type { OutputArtifactError } from "../tools/streaming-output";
 import type { TruncationMeta } from "../tools/output-meta";
 import { resolveImageOptions } from "../render/render-utils";
@@ -415,6 +416,8 @@ export class BashExecutionComponent extends Container {
 						},
 					),
 				);
+				const caption = imageOpenCaption(image, text => theme.fg("muted", text));
+				if (caption) this.#contentContainer.addChild(caption);
 			} else {
 				const dimensions = getImageDimensions(image.data, image.mimeType) ?? undefined;
 				this.#contentContainer.addChild(

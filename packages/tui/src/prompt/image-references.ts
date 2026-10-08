@@ -3,7 +3,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { blobExtensionForImageMimeType } from "./image-format";
 
 /** Materialized image destination returned by the host blob writer. */
-interface ImageBlobResult {
+export interface ImageBlobResult {
 	displayPath: string;
 }
 import { fileHyperlink } from "../render/hyperlink";
@@ -28,7 +28,7 @@ export function setCachedImageDimensions(image: ImageContent, dims: { width: num
 }
 
 type ImageBlobWriter = (data: Buffer, options?: { extension?: string }) => Promise<ImageBlobResult>;
-type ImageBlobWriterSync = (data: Buffer, options?: { extension?: string }) => ImageBlobResult;
+export type ImageBlobWriterSync = (data: Buffer, options?: { extension?: string }) => ImageBlobResult;
 
 export function imageReferenceHyperlink(
 	label: string,
