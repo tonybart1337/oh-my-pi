@@ -11,6 +11,7 @@ import {
 	rebuildScopedModels,
 	rebuildScopedModelsAfterDiscovery,
 	resolveScopedModels,
+	watchRuntimeProviders,
 	type ScopedModelSink,
 	toSessionScopedModels,
 } from "@oh-my-pi/pi-coding-agent/main";
@@ -275,5 +276,49 @@ describe("buildSessionOptions --models scope selection", () => {
 		expect(options.model?.id).toBe("a");
 		expect(options.rebindModelAfterDiscovery).toBe(true);
 		expect(options.scopedModels?.map(entry => entry.model.id)).toEqual(["a"]);
+	});
+});
+
+describe("watchRuntimeProviders", () => {
+	it("follows providers registered and removed while the session runs, once per burst", async () => {
+		const settings = Settings.isolated({ enabledModels: ["prov/*"] });
+		const listeners = new Set<() => void>();
+		const registry = Object.assign(new FakeRegistry([model("a")]), {
+			onRuntimeProvidersChanged(listener: () => void) {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			},
+		});
+		const disposers: Array<() => void> = [];
+		let applied = Promise.withResolvers<void>();
+		const session = Object.assign(new FakeSession(await startupScope(["prov/*"], registry, settings)), {
+			addDisposer: (fn: () => void) => disposers.push(fn),
+		});
+		const setScopedModels = session.setScopedModels.bind(session);
+		session.setScopedModels = scoped => {
+			setScopedModels(scoped);
+			applied.resolve();
+		};
+		const notify = () => {
+			for (const listener of listeners) listener();
+		};
+		watchRuntimeProviders(session, parseArgs([]), registry, settings);
+
+		registry.available = [model("a"), model("b")];
+		notify();
+		notify();
+		await applied.promise;
+		expect(session.scopedModels.map(entry => entry.model.id)).toEqual(["a", "b"]);
+
+		applied = Promise.withResolvers<void>();
+		registry.available = [model("b")];
+		notify();
+		await applied.promise;
+		expect(session.scopedModels.map(entry => entry.model.id)).toEqual(["b"]);
+		// The first burst of two notifications rebuilt once.
+		expect(session.setCalls).toBe(2);
+
+		for (const dispose of disposers) dispose();
+		expect(listeners.size).toBe(0);
 	});
 });
