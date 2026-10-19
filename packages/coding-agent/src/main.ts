@@ -1197,6 +1197,34 @@ export function watchScopedModelSettings(
 	session.addDisposer(stop);
 }
 
+/**
+ * Keep the scoped `/models` list and Ctrl+P cycle in step with providers an
+ * extension registers or removes while the session runs (e.g. a gateway
+ * extension's credential refresh command). The scope is otherwise only
+ * re-resolved at startup and on settings edits, so a provider added at runtime
+ * stayed invisible until a relaunch. A burst of (un)registrations in one tick
+ * triggers a single rebuild.
+ */
+export function watchRuntimeProviders(
+	session: ScopedModelSink & Pick<AgentSession, "addDisposer">,
+	parsed: Args,
+	modelRegistry: Pick<ModelRegistry, "getAvailable" | "onRuntimeProvidersChanged">,
+	activeSettings: Settings,
+): void {
+	let queued = false;
+	const stop = modelRegistry.onRuntimeProvidersChanged(() => {
+		if (queued) return;
+		queued = true;
+		queueMicrotask(() => {
+			queued = false;
+			void rebuildScopedModels(session, parsed, modelRegistry, activeSettings).catch(error =>
+				logger.warn("Scoped model rebuild after provider change failed", { error: String(error) }),
+			);
+		});
+	});
+	session.addDisposer(stop);
+}
+
 async function getChangelogForDisplay(
 	parsed: Args,
 	mode: SettingValueOf<typeof cfgStartupChangelogMode>,
@@ -2721,6 +2749,7 @@ export async function runRootCommand(
 				await rebuildScopedModels(session, parsedArgs, modelRegistry, settingsInstance);
 			};
 			watchScopedModelSettings(session, parsedArgs, modelRegistry, settingsInstance);
+			watchRuntimeProviders(session, parsedArgs, modelRegistry, settingsInstance);
 
 			if (modelFallbackMessage) {
 				notifs.push({ kind: "warn", message: modelFallbackMessage });
