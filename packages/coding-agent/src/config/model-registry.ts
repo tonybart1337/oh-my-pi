@@ -354,6 +354,8 @@ export class ModelRegistry {
 	#initialRefreshSettled = false;
 	/** Waiter armed before the initial background refresh starts (CLI kicks it off after the session is built, #10048). */
 	#initialRefreshWaiters = new Set<() => void>();
+	/** Notified after an extension (un)registers a provider once the session is running. */
+	#runtimeProviderListeners = new Set<() => void>();
 	#credentialScopedCacheHydration?: Promise<void>;
 	#configuredDiscoveryInFlight: Map<
 		DiscoveryProviderConfig,
@@ -3430,6 +3432,21 @@ export class ModelRegistry {
 			this.#clearRuntimeProviderState(providerName);
 		}
 		this.#reloadStaticModels({ force: true, preserveRuntimeDiscovery: true });
+	}
+
+	/**
+	 * Subscribe to extension provider (un)registrations made after startup, so a
+	 * frozen view (the session's scoped `/models` list) can follow them. Returns
+	 * the unsubscribe.
+	 */
+	onRuntimeProvidersChanged(listener: () => void): () => void {
+		this.#runtimeProviderListeners.add(listener);
+		return () => this.#runtimeProviderListeners.delete(listener);
+	}
+
+	/** Called by the extension runner after a runtime `registerProvider`/`unregisterProvider`. */
+	notifyRuntimeProvidersChanged(): void {
+		for (const listener of this.#runtimeProviderListeners) listener();
 	}
 
 	/**

@@ -831,9 +831,11 @@ export class ExtensionRunner {
 		this.runtime.setSessionName = actions.setSessionName;
 		this.runtime.registerProvider = (name, config, sourceId) => {
 			this.modelRegistry.registerProvider(name, config, sourceId);
+			this.modelRegistry.notifyRuntimeProvidersChanged();
 		};
 		this.runtime.unregisterProvider = name => {
 			this.modelRegistry.unregisterProvider(name);
+			this.modelRegistry.notifyRuntimeProvidersChanged();
 		};
 
 		// Context actions (required)
