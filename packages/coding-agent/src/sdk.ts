@@ -275,6 +275,7 @@ import {
 	concreteThinkingLevel,
 	newSessionThinkingLevel,
 	parseConfiguredThinkingLevel,
+	parseEffort,
 	parseThinkingLevel,
 	resolveConfiguredThinkingLevel,
 	shouldDisableReasoning,
@@ -374,6 +375,7 @@ import {
 	cfgInlineToolDescriptors,
 	cfgPersonality,
 	cfgProviderAppendOnlyContext,
+	cfgProvidersAutoThinkingFallback,
 	cfgProvidersCacheWarming,
 	cfgProvidersKimiApiFormat,
 	cfgRetryFallbackChains,
@@ -2337,6 +2339,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		);
 	};
 	let thinkingLevel = pickInitialThinkingLevel(model);
+	const autoThinkingFallback = parseEffort(cfgProvidersAutoThinkingFallback.get(settings));
 	let autoThinking = thinkingLevel === AUTO_THINKING;
 	// Concrete level the agent/session start with. With `auto` this is the
 	// provisional level shown until the first per-turn classification resolves;
@@ -2345,7 +2348,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	if (model) {
 		const resolvedModel = model;
 		effectiveThinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
-			resolveConfiguredThinkingLevel(resolvedModel, thinkingLevel),
+			resolveConfiguredThinkingLevel(resolvedModel, thinkingLevel, autoThinkingFallback),
 		);
 		// Fire-and-forget connection warm-up so the handshake overlaps the rest
 		// of session setup (extension/skill load, tool registry, system prompt
@@ -2381,7 +2384,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		thinkingLevel = pickInitialThinkingLevel(selectedModel);
 		autoThinking = thinkingLevel === AUTO_THINKING;
 		effectiveThinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
-			resolveConfiguredThinkingLevel(selectedModel, thinkingLevel),
+			resolveConfiguredThinkingLevel(selectedModel, thinkingLevel, autoThinkingFallback),
 		);
 	};
 

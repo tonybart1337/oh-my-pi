@@ -176,14 +176,17 @@ export function newSessionThinkingLevel(
 
 /**
  * Concrete level `selector` runs at on `model`: clamped to its ladder, or the
- * provisional effort while `auto` awaits its first per-turn classification.
+ * provisional effort while `auto` awaits its first per-turn classification
+ * (`autoFallback` is the `providers.autoThinkingFallback` setting, see
+ * {@link resolveProvisionalAutoLevel}).
  */
 export function resolveConfiguredThinkingLevel(
 	model: Model | undefined,
 	selector: ConfiguredThinkingLevel | undefined,
+	autoFallback?: Effort,
 ): ResolvedThinkingLevel | undefined {
 	return selector === AUTO_THINKING
-		? resolveProvisionalAutoLevel(model)
+		? resolveProvisionalAutoLevel(model, autoFallback)
 		: resolveThinkingLevelForModel(model, selector);
 }
 
@@ -407,7 +410,8 @@ export function assertModelSupportsEffortCeiling(model: Model, maxEffort: Effort
 /**
  * The provisional concrete level shown while `auto` is configured but before a
  * turn has been classified, and the fallback when classification fails. Prefers
- * the model's `defaultLevel`, otherwise High, clamped into the auto range.
+ * `fallback` (the `providers.autoThinkingFallback` setting), then the model's
+ * `defaultLevel`, otherwise High, clamped into the auto range.
  *
  * Deliberately stays below {@link Effort.Max}: the placeholder must not bill the
  * top tier for a turn nobody classified, so XHigh is passed as a hard ceiling
@@ -418,8 +422,8 @@ export function assertModelSupportsEffortCeiling(model: Model, maxEffort: Effort
  * expose the tier when the user opts in. Returns `undefined` for non-reasoning
  * models.
  */
-export function resolveProvisionalAutoLevel(model: Model | undefined): Effort | undefined {
+export function resolveProvisionalAutoLevel(model: Model | undefined, fallback?: Effort): Effort | undefined {
 	if (!model?.reasoning || model.thinking?.unverified) return undefined;
-	const preferred = model.thinking?.defaultLevel ?? Effort.High;
+	const preferred = fallback ?? model.thinking?.defaultLevel ?? Effort.High;
 	return clampAutoThinkingEffort(model, preferred === Effort.Max ? Effort.XHigh : preferred, Effort.XHigh);
 }

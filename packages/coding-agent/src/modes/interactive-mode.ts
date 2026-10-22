@@ -185,6 +185,7 @@ import {
 	type ConfiguredThinkingLevel,
 	newSessionThinkingLevel,
 	parseConfiguredThinkingLevel,
+	parseEffort,
 	resolveConfiguredThinkingLevel,
 } from "@oh-my-pi/pi-tui/thinking";
 import { isMCPToolName } from "../tools/builtin-names";
@@ -459,7 +460,7 @@ import {
 import { cfgTasksTodoClearDelay } from "../tools/settings";
 import { cfgWorktreeOnExit, cfgWorktreeOnStart } from "../task/settings";
 import { cfgExpandThinkingBlocks, cfgProseOnlyThinking } from "../session/settings";
-import { cfgDefaultThinkingLevel, cfgHideThinkingBlock } from "../session/settings";
+import { cfgDefaultThinkingLevel, cfgHideThinkingBlock, cfgProvidersAutoThinkingFallback } from "../session/settings";
 import { cfgCycleOrder, cfgModelRoles } from "../config/model-settings";
 import { cfgExtensionHandlersModeControl } from "../extensibility/settings";
 import { cfgGoalContinuationModes, cfgGoalEnabled } from "../goals/settings";
@@ -4752,7 +4753,11 @@ export class InteractiveMode implements InteractiveModeContext {
 				settings: statusLineHost.getSettings(),
 				gitEnabled: statusLineHost.gitEnabled(),
 				model,
-				thinkingLevel: resolveConfiguredThinkingLevel(model, thinking),
+				thinkingLevel: resolveConfiguredThinkingLevel(
+					model,
+					thinking,
+					parseEffort(cfgProvidersAutoThinkingFallback.get(this.settings)),
+				),
 				autoThinking: thinking === AUTO_THINKING,
 				// A fresh session derives tiers from settings, not this session's `/fast` toggles.
 				fastMode: this.session.isFastModeConfiguredFor(model),
