@@ -1108,6 +1108,28 @@ export const cfgProvidersAutoThinkingMaxEffort = register({
 	},
 });
 
+export const cfgProvidersAutoThinkingFallback = register({
+	id: "providers.autoThinkingFallback",
+	type: "enum",
+	values: ["model", "low", "medium", "high", "xhigh"] as const,
+	default: "model",
+	ui: {
+		tab: "model",
+		group: "Thinking",
+		label: "Auto Thinking Fallback",
+		description:
+			"Effort `auto` uses before a turn is classified and whenever classification fails. `model` keeps the built-in behavior: the model's default level (else high) until the first classification, then the last classified level on failure. A concrete level is used for every unclassified turn, clamped to the model's ladder.",
+		condition: "autoThinkingActive",
+		options: [
+			{ value: "model", label: "model", description: "Model default, then the last classified level (default)" },
+			{ value: "low", label: "low", description: "Unclassified turns run at low" },
+			{ value: "medium", label: "medium", description: "Unclassified turns run at medium" },
+			{ value: "high", label: "high", description: "Unclassified turns run at high" },
+			{ value: "xhigh", label: "xhigh", description: "Unclassified turns run at xhigh" },
+		],
+	},
+});
+
 export const cfgFeaturesUnexpectedStopDetection = register({
 	id: "features.unexpectedStopDetection",
 	type: "enum",
