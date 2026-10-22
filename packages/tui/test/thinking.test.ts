@@ -55,6 +55,13 @@ describe("thinking before capability discovery", () => {
 		expect(nonreasoner.thinking).toBeUndefined();
 		expect(resolveConfiguredThinkingLevel(nonreasoner, AUTO_THINKING)).toBeUndefined();
 	});
+
+	it("applies providers.autoThinkingFallback to auto while capability is unverified", () => {
+		expect(resolveProvisionalAutoLevel(model, Effort.Low)).toBe(Effort.Low);
+		expect(resolveConfiguredThinkingLevel(model, AUTO_THINKING, Effort.Medium)).toBe(Effort.Medium);
+		// Max stays below the top tier, like the model-driven placeholder.
+		expect(resolveConfiguredThinkingLevel(model, AUTO_THINKING, Effort.Max)).toBe(Effort.XHigh);
+	});
 });
 
 const DEFERRED_LEVELS: Array<ThinkingLevel | undefined> = [undefined, ThinkingLevel.Inherit, ThinkingLevel.Off];

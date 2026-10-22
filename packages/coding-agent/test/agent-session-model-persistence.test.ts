@@ -465,6 +465,39 @@ describe("AgentSession model persistence", () => {
 		expect(result.session.thinkingLevel).not.toBe(Effort.Max);
 	});
 
+	it("starts a fresh DEFAULT-role auto session at providers.autoThinkingFallback before any classification", async () => {
+		const model = getBundledModel("zai", "glm-5.3");
+		if (!model) throw new Error("Expected zai/glm-5.3 to exist");
+		const settings = Settings.isolated({
+			defaultThinkingLevel: AUTO_THINKING,
+			"providers.autoThinkingFallback": "low",
+		});
+		settings.setModelRole("default", modelValue(model));
+		const result = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			authStorage: sharedAuthStorage,
+			modelRegistry: sharedModelRegistry,
+			sessionManager: SessionManager.create(tempDir.path(), path.join(tempDir.path(), "fresh-auto-fallback")),
+			settings,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+		});
+		session = result.session;
+
+		const provisional = resolveProvisionalAutoLevel(model, Effort.Low);
+		expect(provisional).not.toBe(resolveProvisionalAutoLevel(model));
+		expect(result.session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		expect(result.session.thinkingLevel).toBe(provisional);
+		expect(result.session.agent.state.thinkingLevel).toBe(provisional);
+	});
+
 	it("marks an incomplete process-exit transcript aborted during SDK resume without dropping history", async () => {
 		const sessionManager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "interrupted"));
 		const interruptedAssistant: AssistantMessage = {

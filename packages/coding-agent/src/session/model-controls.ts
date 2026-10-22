@@ -35,6 +35,7 @@ import {
 	type ConfiguredThinkingLevel,
 	clampAutoThinkingEffort,
 	clampThinkingLevelToCeiling,
+	parseEffort,
 	resolveProvisionalAutoLevel,
 	resolveThinkingLevelForModel,
 	shouldDisableReasoning,
@@ -49,6 +50,7 @@ import type { SessionManager } from "./session-manager";
 
 import {
 	cfgDefaultThinkingLevel,
+	cfgProvidersAutoThinkingFallback,
 	cfgProvidersFireworksTier,
 	cfgTierAnthropic,
 	cfgTierGoogle,
@@ -183,7 +185,7 @@ export class ModelControls {
 			this.#autoThinking = true;
 			this.#thinkingLevel = clampThinkingLevelToCeiling(
 				this.#model,
-				resolveProvisionalAutoLevel(this.#model),
+				resolveProvisionalAutoLevel(this.#model, this.#autoThinkingFallback()),
 				this.#thinkingLevelCeiling,
 			);
 		} else {
@@ -225,6 +227,11 @@ export class ModelControls {
 		return this.#autoResolvedLevel;
 	}
 
+	/** Explicit `providers.autoThinkingFallback` effort; `undefined` keeps the model-driven fallback. */
+	#autoThinkingFallback(): Effort | undefined {
+		return parseEffort(cfgProvidersAutoThinkingFallback.get(this.#host.settings));
+	}
+
 	/** Models explicitly scoped to the session's cycle command, minus currently disabled providers. */
 	get scopedModels(): ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }> {
 		const disabledProviders = cfgDisabledProviders.get(this.#host.settings);
@@ -255,7 +262,7 @@ export class ModelControls {
 			level === AUTO_THINKING
 				? clampThinkingLevelToCeiling(
 						this.#model,
-						resolveProvisionalAutoLevel(this.#model),
+						resolveProvisionalAutoLevel(this.#model, this.#autoThinkingFallback()),
 						this.#thinkingLevelCeiling,
 					)
 				: resolveThinkingLevelForModel(
@@ -554,7 +561,7 @@ export class ModelControls {
 		if (level === AUTO_THINKING) {
 			const provisional = clampThinkingLevelToCeiling(
 				this.#model,
-				resolveProvisionalAutoLevel(this.#model),
+				resolveProvisionalAutoLevel(this.#model, this.#autoThinkingFallback()),
 				this.#thinkingLevelCeiling,
 			);
 			const wasAuto = this.#autoThinking;
@@ -705,9 +712,14 @@ export class ModelControls {
 		// Drop the result if the turn was aborted/superseded while classifying.
 		if (this.#host.promptGeneration() !== generation || !this.#autoThinking) return;
 
+		// An explicit fallback setting wins over the last classified level; the
+		// model-driven default keeps the last classification instead.
+		const fallback = this.#autoThinkingFallback();
 		const effort = clampThinkingLevelToCeiling(
 			model,
-			resolved ?? this.#autoResolvedLevel ?? resolveProvisionalAutoLevel(model),
+			resolved ??
+				(fallback === undefined ? this.#autoResolvedLevel : undefined) ??
+				resolveProvisionalAutoLevel(model, fallback),
 			this.#thinkingLevelCeiling,
 		);
 		if (effort === undefined) return;
