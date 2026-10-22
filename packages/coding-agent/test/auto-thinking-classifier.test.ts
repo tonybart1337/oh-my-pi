@@ -13,6 +13,7 @@ import {
 	parseConfiguredThinkingLevel,
 	parseEffort,
 	parseThinkingLevel,
+	resolveConfiguredThinkingLevel,
 	resolveProvisionalAutoLevel,
 	resolveTaskEffortLevel,
 } from "@oh-my-pi/pi-coding-agent/thinking/levels";
@@ -374,6 +375,35 @@ describe("auto thinking classifier helpers", () => {
 
 		expect(await classifyDifficulty({ request: "rename a helper" }, keyless)).toBe(Effort.Minimal);
 		expect(fixture.completeSimpleMock).not.toHaveBeenCalled();
+	});
+
+	it("resolves a configured auto selector at the autoThinkingFallback effort, leaving concrete selectors alone", () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-6");
+		if (!model) throw new Error("Expected bundled Claude Sonnet 4.6 model");
+
+		expect(resolveConfiguredThinkingLevel(model, AUTO_THINKING, Effort.Low)).toBe(Effort.Low);
+		expect(resolveConfiguredThinkingLevel(model, AUTO_THINKING)).toBe(resolveProvisionalAutoLevel(model));
+		expect(resolveConfiguredThinkingLevel(model, Effort.High, Effort.Low)).toBe(Effort.High);
+	});
+
+	it("applies autoThinkingFallback to auto while a model's thinking capability is unverified", () => {
+		const model = buildModel({
+			id: "custom-unverified",
+			name: "custom-unverified",
+			api: "openai-completions",
+			provider: "custom",
+			baseUrl: "https://example.com/v1",
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_000,
+		});
+		expect(model.thinking?.unverified).toBe(true);
+
+		expect(resolveProvisionalAutoLevel(model, Effort.Low)).toBe(Effort.Low);
+		expect(resolveConfiguredThinkingLevel(model, AUTO_THINKING, Effort.Medium)).toBe(Effort.Medium);
+		// Max stays below the top tier, like the model-driven placeholder.
+		expect(resolveConfiguredThinkingLevel(model, AUTO_THINKING, Effort.Max)).toBe(Effort.XHigh);
 	});
 
 	it("keeps the provisional auto level below max even when the model defaults to it", () => {
