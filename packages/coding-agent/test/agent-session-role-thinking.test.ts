@@ -14,7 +14,7 @@ import { AUTO_THINKING, clampAutoThinkingEffort, resolveProvisionalAutoLevel } f
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
-import { cfgDefaultThinkingLevel } from "@oh-my-pi/pi-coding-agent/session/settings";
+import { cfgDefaultThinkingLevel, cfgProvidersAutoThinkingFallback } from "@oh-my-pi/pi-coding-agent/session/settings";
 
 describe("AgentSession role model thinking behavior", () => {
 	let tempDir: TempDir;
@@ -681,6 +681,30 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.sessionManager.getEntries().filter(entry => entry.type === "thinking_level_change")).toHaveLength(
 			receiptCount,
 		);
+	});
+
+	it("uses the configured auto fallback instead of the last classified level", async () => {
+		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: model.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${model.provider}/${model.id}` },
+		});
+		cfgProvidersAutoThinkingFallback.set(sessionSettings, "medium");
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		vi.spyOn(autoThinkingClassifier, "classifyDifficulty")
+			.mockResolvedValueOnce(Effort.XHigh)
+			.mockRejectedValueOnce(new Error("classifier down"));
+
+		session.setThinkingLevel(AUTO_THINKING);
+		expect(session.thinkingLevel).toBe(Effort.Medium);
+		await session.prompt("Redesign the storage layer");
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+		await session.prompt("Investigate another update");
+
+		expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		expect(session.thinkingLevel).toBe(Effort.Medium);
+		expect(session.agent.state.thinkingLevel).toBe(Effort.Medium);
 	});
 
 	it("skips classification for synthetic turns", async () => {
