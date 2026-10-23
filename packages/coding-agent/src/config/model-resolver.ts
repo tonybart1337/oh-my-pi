@@ -11,8 +11,8 @@ import {
  * Layering:
  * - `matchModel` is the single matching engine. Order: exact `provider/id`
  *   reference (with variant-alias and OpenRouter routed/date fallbacks) →
- *   exact bare id → retired variant alias → substring (bare selectors only)
- *   with alias-vs-dated pick.
+ *   exact bare id → retired variant alias → newest family revision →
+ *   substring (bare selectors only) with alias-vs-dated pick.
  * - `parseModelPatternWithContext`/`parseModelPattern` layer the selector
  *   grammar on top: trailing `:level` thinking suffixes (`splitThinkingSuffix`)
  *   and `@upstream` provider routing (`splitUpstreamRouting`).
@@ -30,7 +30,13 @@ import { roleDefaultModels } from "@oh-my-pi/pi-catalog/compat/behavior";
 import { resolveBareVariantSelector, resolveVariantSelector } from "@oh-my-pi/pi-catalog/compat/collapse";
 import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
 import { providerEntry } from "@oh-my-pi/pi-catalog/compat/providers";
-import { collapseVariantId, stripThinkingVariantSuffix } from "@oh-my-pi/pi-catalog/compat/taxonomy";
+import { compareRevision, parseRevision, type Revision } from "@oh-my-pi/pi-catalog/compat/revision";
+import {
+	classifyModel,
+	collapseVariantId,
+	isModelFamily,
+	stripThinkingVariantSuffix,
+} from "@oh-my-pi/pi-catalog/compat/taxonomy";
 import { modelMatchesHost } from "@oh-my-pi/pi-catalog/hosts";
 import { buildModelProviderPriorityRank } from "@oh-my-pi/pi-catalog/identity";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
@@ -649,6 +655,37 @@ function pickPreferredModel(candidates: Model<Api>[], context: ModelPreferenceCo
 	})[0];
 }
 
+/** Family selectors rank numeric catalog revisions before usage/provider preferences. */
+function matchLatestFamily(
+	pattern: string,
+	availableModels: Model<Api>[],
+	context: ModelPreferenceContext,
+): { model: Model<Api> | undefined } | undefined {
+	const slashIndex = pattern.indexOf("/");
+	const provider = slashIndex === -1 ? undefined : pattern.slice(0, slashIndex).toLowerCase();
+	const selector = (slashIndex === -1 ? pattern : pattern.slice(slashIndex + 1)).toLowerCase();
+	const family = selector.endsWith("-latest") ? selector.slice(0, -"-latest".length) : selector;
+	if (!isModelFamily(family)) return undefined;
+
+	let newest: Revision | undefined;
+	const candidates: Model<Api>[] = [];
+	for (const model of availableModels) {
+		const identity = classifyModel(model.provider, model.id);
+		if (identity.family !== family) continue;
+		if (provider !== undefined && model.provider.toLowerCase() !== provider) continue;
+		const revision = identity.revision === undefined ? undefined : parseRevision(identity.revision);
+		if (newest !== undefined && revision === undefined) continue;
+		const comparison = revision === undefined ? 0 : newest === undefined ? 1 : compareRevision(revision, newest);
+		if (comparison < 0) continue;
+		if (comparison > 0) {
+			newest = revision;
+			candidates.length = 0;
+		}
+		candidates.push(model);
+	}
+	return { model: candidates.length > 0 ? pickPreferredModel(candidates, context) : undefined };
+}
+
 /**
  * Helper to check if a model ID looks like an alias (no date suffix)
  * Dates are typically in format: -20241022 or -20250929
@@ -743,7 +780,17 @@ function findExactModelReferenceMatch(modelReference: string, availableModels: M
 		const provider = trimmedReference.substring(0, slashIndex).trim();
 		const modelId = trimmedReference.substring(slashIndex + 1).trim();
 		if (provider && modelId) {
-			return resolveProviderModelReference(provider, modelId, availableModels);
+			const resolved = resolveProviderModelReference(provider, modelId, availableModels);
+			// Legacy provider aliases are not exact IDs: family shorthand must
+			// reach revision-aware matching in every caller, including the CLI.
+			if (
+				resolved &&
+				resolved.id.toLowerCase() !== modelId.toLowerCase() &&
+				classifyModel(resolved.provider, resolved.id).family === modelId.toLowerCase()
+			) {
+				return undefined;
+			}
+			return resolved;
 		}
 	}
 	return undefined;
@@ -754,12 +801,14 @@ function findExactModelReferenceMatch(modelReference: string, availableModels: M
  *    fallbacks included),
  * 2. exact bare id (preference-ranked),
  * 3. retired effort-tier variant alias (collapsed catalog entries),
- * 4. substring match with the alias-vs-dated pick.
- * A selector whose prefix names a known provider stops after the exact phases:
+ * 4. newest numeric family revision (`family` or `family-latest`, bare or
+ *    provider-qualified; a qualified family stays on its provider),
+ * 5. substring match with the alias-vs-dated pick.
+ * A selector whose prefix names a known provider stops after the family phase:
  * it never falls back to a sibling id. Returns the matched model or undefined.
  *
- * `exactOnly` stops after the exact phases (1-3), skipping the substring
- * fallback (4). Callers use it to resolve the full selector exactly before
+ * `exactOnly` stops after the exact phases (1-3), skipping the family and
+ * substring fallbacks (4-5). Callers use it to resolve the full selector exactly before
  * a trailing `:<level>` thinking suffix is split off, so the suffix can never
  * be absorbed into a longer sibling id (e.g. `kimi-for-coding:high`
  * must not match `kimi-for-coding-highspeed`).
@@ -818,6 +867,12 @@ function matchModel(
 	if (options?.exactOnly) {
 		return undefined;
 	}
+	// Family selectors (`sol`, `sol-latest`, `provider/sol-latest`) name a
+	// catalog family, not a sibling id: they pick its newest revision, and a
+	// provider-qualified one stays on that provider.
+	const familyMatch = matchLatestFamily(modelPattern, availableModels, context);
+	if (familyMatch) return familyMatch.model;
+
 	// A `provider/modelId` selector naming a known provider resolves exactly or
 	// not at all: the exact phases above already covered its ids and aliases, and
 	// fuzzy-matching within the provider would silently run a sibling model
@@ -2330,7 +2385,7 @@ function resolveCliModelInScope(
 	}
 
 	if (provider) {
-		const exactProviderMatch = resolveProviderModelReference(provider, pattern, allModels);
+		const exactProviderMatch = findExactModelReferenceMatch(`${provider}/${pattern}`, allModels);
 		if (exactProviderMatch) {
 			return {
 				model: exactProviderMatch,

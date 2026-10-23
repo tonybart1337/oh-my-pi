@@ -111,6 +111,9 @@
 - Fixed Kimi Code K3 and K3 256K (`k3`, `k3-256k`) pricing to include Kimi's $3/MTok cache-write rate, matching the Moonshot API `kimi-k3` card ([#16508](https://github.com/can1357/oh-my-pi/issues/16508), [#16903](https://github.com/can1357/oh-my-pi/pull/16903) by [@eggpeat](https://github.com/eggpeat))
 - Fixed Devin models all showing a 200K context window: each model now reports its own (1M for Claude Opus 5.5 and the `-1m` lanes, 262K for SWE-2), and GPT and Grok models with a long-context price tier start at that tier's threshold, with `/extended-context on` opening their full window ([#16905](https://github.com/can1357/oh-my-pi/pull/16905) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed Cursor Auto (`cursor/default`) being metered against the third-party ("Other Models") pool instead of the Cursor Models pool it bills to ([#17048](https://github.com/can1357/oh-my-pi/pull/17048) by [@trukhinyuri](https://github.com/trukhinyuri))
+### Added
+
+- Added distinct Sol, Terra, and Luna catalog families across GPT revisions while retaining their existing provider effort and pricing policies
 
 ## [18.12.6] - 2026-10-21
 

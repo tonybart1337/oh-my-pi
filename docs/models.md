@@ -650,7 +650,8 @@ not an allowlist of model transports.
 
 - exact `provider/modelId`
 - exact model id (provider inferred)
-- fuzzy/substring matching for bare ids (`opus`, `gpt-5.2`); a `provider/modelId` selector must match exactly
+- family names or `family-latest` (`opus`, `sonnet`, `haiku`, `sol`, `terra`, `luna`), bare or provider-qualified
+- fuzzy/substring matching for bare ids (`gpt-5.2`); any other `provider/modelId` selector must match exactly
 - glob scope patterns in `--models` (e.g. `openai/*`, `*sonnet*`)
 - optional `:thinkingLevel` suffix (`off|minimal|low|medium|high|xhigh|max|auto|inherit`)
 - `@upstream` routing suffix on OpenRouter and Vercel Gateway selectors (for example, `openrouter/anthropic/claude-sonnet-5@anthropic:high`); an exact literal model id still wins
@@ -663,11 +664,19 @@ Resolution precedence for exact selectors:
 1. exact `provider/modelId` reference
 2. exact bare id (case-insensitive); when several providers carry the same id, a preference ranking picks the winner (see below)
 3. retired effort-tier variant alias (collapsed catalog entries, e.g. `X`/`X-thinking` twins)
-4. substring matching with an alias-vs-dated pick (bare ids only)
+4. family name or `family-latest`: newest numeric catalog revision, with the preference ranking below used only for equal revisions
+5. substring matching with an alias-vs-dated pick (bare ids only)
 
-A `provider/modelId` selector whose provider is known stops after the exact phases: it never runs a similarly named sibling. A miss fails with `Model "…" not found`, which suggests up to three close ids from that provider. A configured default model that misses produces a warning naming it and the model that runs instead, unless a configured `retry.fallbackChains` entry takes over; a configured dictation model that misses warns the same way.
+A `provider/modelId` selector whose provider is known stops after the exact and family phases: it never runs a similarly named sibling. A miss fails with `Model "…" not found`, which suggests up to three close ids from that provider. A configured default model that misses produces a warning naming it and the model that runs instead, unless a configured `retry.fallbackChains` entry takes over; a configured dictation model that misses warns the same way.
 
 Glob scope patterns (used by `enabledModels` and CLI `--models`) run separately over concrete models after exact matching.
+
+Family selectors follow catalog identity rather than display-name substrings. For example,
+`agentgw-codex-main/sol-latest:auto` selects that provider's newest available Sol revision and
+preserves automatic effort; `sol` and `sol-latest` both follow new revisions without editing
+configuration. Revisions compare numerically (`6.10` is newer than `6.9`); numbered revisions
+outrank unversioned aliases. An exact model ID remains pinned, even when an older revision is
+also a member of that family. Provider-qualified families never select a different provider.
 
 When a bare id matches models from multiple providers, preference order is:
 
@@ -710,7 +719,7 @@ Role aliases like `@smol` expand through `settings.modelRoles`; `*` selects `@de
 
 Role values can contain comma-separated selectors; selection uses the first available match,
 not a per-request retry chain. Request-failure fallbacks are configured separately under
-`retry.fallbackChains` (role, exact model, or provider-wildcard keys; see [Settings](./settings.md)).
+`retry.fallbackChains` (role, exact model, or provider/model-ID-glob keys; see [Settings](./settings.md)).
 Custom role names
 can be introduced through `modelRoles`, `modelTags`, or `cycleOrder`; they use chat models.
 Unset `smol` and `slow` inherit an explicitly configured `default` before their built-in priority

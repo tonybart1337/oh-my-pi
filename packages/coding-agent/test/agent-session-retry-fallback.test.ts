@@ -27,6 +27,7 @@ import { resolveModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-model
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
+import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 import { parseModelPattern } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { editVariantForModel } from "@oh-my-pi/pi-coding-agent/utils/edit-mode";
@@ -333,6 +334,39 @@ describe("AgentSession retry fallback", () => {
 			session = undefined;
 		}
 		vi.restoreAllMocks();
+	});
+
+	it("retries a family-glob chain on its newest concrete target with configured auto thinking", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const base = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !base) throw new Error("Expected bundled fallback test models");
+		const old = buildModel({ ...base, id: "gpt-6.1-sol", name: "Older Sol" });
+		const latest = buildModel({ ...base, id: "gpt-6.2-sol", name: "Newest Sol" });
+		const providerModels = modelRegistry.getProviderModels.bind(modelRegistry);
+		const availableModels = modelRegistry.getAvailable.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getProviderModels").mockImplementation(provider =>
+			provider === "openai" ? [old, latest] : providerModels(provider),
+		);
+		vi.spyOn(modelRegistry, "getAvailable").mockImplementation(() => [...availableModels(), old, latest]);
+		const requested: string[] = [];
+		const agent = createFallbackAgent(primary, requested);
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": { "anthropic/*sonnet*": ["openai/sol-latest:auto"] },
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		session.setThinkingLevel(Effort.Low);
+		await session.prompt("Recover using the configured latest family");
+		await session.waitForIdle();
+		expect(requested).toEqual([`${primary.provider}/${primary.id}`, `openai/${latest.id}`]);
+		expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		expect(session.isAutoThinking).toBe(true);
 	});
 
 	it("advances through a role-keyed fallback chain across retries", async () => {

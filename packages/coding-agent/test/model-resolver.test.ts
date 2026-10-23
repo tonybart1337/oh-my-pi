@@ -564,6 +564,140 @@ describe("parseModelPattern", () => {
 		});
 	});
 
+	describe("latest family selectors", () => {
+		test.each([
+			["opus", "claude-opus-5", "claude-opus-5-5"],
+			["sonnet", "claude-sonnet-4-6", "claude-sonnet-5"],
+			["haiku", "claude-haiku-4-5", "claude-haiku-5"],
+			["sol", "gpt-6.0-sol", "gpt-6.1-sol"],
+			["terra", "gpt-6.1-terra", "gpt-6.2-terra"],
+			["luna", "gpt-5.6-luna", "gpt-6.1-luna"],
+		])("%s family selectors ignore older catalog and usage precedence", (family, oldId, newId) => {
+			const older = roleChainModel("gateway", oldId);
+			const newer = roleChainModel("gateway", newId);
+			const models = [older, newer];
+			const preferences = { usageOrder: [`gateway/${oldId}`] };
+			expect(parseModelPattern(family, models, preferences).model?.id).toBe(newId);
+			expect(parseModelPattern(`${family}-latest`, models, preferences).model?.id).toBe(newId);
+		});
+
+		test("numeric revisions select 6.10 over 6.9 rather than sorting as text", () => {
+			const models = [roleChainModel("gateway", "gpt-6.9-sol"), roleChainModel("gateway", "gpt-6.10-sol")];
+			expect(parseModelPattern("sol-latest", models).model?.id).toBe("gpt-6.10-sol");
+		});
+
+		test("usage and provider preferences break ties only within the newest revision", () => {
+			const models = [
+				roleChainModel("preferred", "gpt-6.0-sol"),
+				roleChainModel("preferred", "gpt-6.1-sol"),
+				roleChainModel("recent", "gpt-6-1-sol"),
+			];
+			const byProvider = parseModelPattern("sol", models, { providerOrder: ["preferred"] });
+			expect(byProvider.model?.provider).toBe("preferred");
+			expect(byProvider.model?.id).toBe("gpt-6.1-sol");
+			const byUsage = parseModelPattern("sol", models, {
+				providerOrder: ["preferred"],
+				usageOrder: ["preferred/gpt-6.0-sol", "recent/gpt-6-1-sol"],
+			});
+			expect(byUsage.model?.provider).toBe("recent");
+			expect(byUsage.model?.id).toBe("gpt-6-1-sol");
+		});
+
+		test("exact old IDs remain pinned despite a newer family revision", () => {
+			const models = [roleChainModel("gateway", "gpt-6.1-sol"), roleChainModel("gateway", "gpt-6.0-sol")];
+			expect(parseModelPattern("gateway/gpt-6.0-sol", models).model?.id).toBe("gpt-6.0-sol");
+			expect(parseModelPattern("gpt-6.0-sol", models).model?.id).toBe("gpt-6.0-sol");
+			const literal = roleChainModel("gateway", "sol-latest");
+			expect(parseModelPattern("sol-latest", [...models, literal]).model?.id).toBe("sol-latest");
+		});
+
+		test("provider-qualified families neither select nor fall through to another provider", () => {
+			const models = [
+				roleChainModel("gateway", "gpt-6.1-sol"),
+				roleChainModel("other", "gpt-6.2-sol"),
+				roleChainModel("unrelated", "custom-model"),
+			];
+			expect(parseModelPattern("gateway/sol", models).model?.id).toBe("gpt-6.1-sol");
+			expect(parseModelPattern("gateway/sol-latest", models).model?.provider).toBe("gateway");
+			expect(parseModelPattern("missing/sol-latest", models).model).toBeUndefined();
+			expect(parseModelPattern("unrelated/sol", models).model).toBeUndefined();
+		});
+
+		test("provider-qualified families pass the exact-id lock that near-miss ids hit", () => {
+			const models = [roleChainModel("gateway", "gpt-6.0-sol"), roleChainModel("gateway", "gpt-6.1-sol")];
+			expect(parseModelPattern("gateway/sol-latest:auto", models).model?.id).toBe("gpt-6.1-sol");
+			expect(parseModelPattern("gateway/gpt-6.1-so", models).model).toBeUndefined();
+			const registry = { getAll: () => models, getAvailable: () => models };
+			expect(resolveCliModel({ cliModel: "gateway/sol-latest", modelRegistry: registry }).model?.id).toBe(
+				"gpt-6.1-sol",
+			);
+			const miss = resolveCliModel({ cliModel: "gateway/gpt-6.1-so", modelRegistry: registry });
+			expect(miss.model).toBeUndefined();
+			expect(miss.error).toContain("Did you mean gateway/gpt-6.1-sol");
+		});
+
+		test("unavailable families skip unrelated substring matches in ordered role selectors", () => {
+			const models = [roleChainModel("gateway", "solitude-model"), roleChainModel("gateway", "custom-model")];
+			expect(parseModelPattern("sol", models).model).toBeUndefined();
+			expect(parseModelPattern("gateway/sol", models).model).toBeUndefined();
+			const result = resolveModelRoleValue("sol-latest, gateway/custom-model", models);
+			expect(result.model?.id).toBe("custom-model");
+			expect(result.matchedPatternIndex).toBe(1);
+		});
+
+		test("role family selectors preserve explicit auto effort after selecting the latest model", () => {
+			const models = [
+				roleChainModel("agentgw-codex-main", "gpt-6.0-sol"),
+				roleChainModel("agentgw-codex-main", "gpt-6.1-sol"),
+			];
+			const result = resolveModelRoleValue("agentgw-codex-main/sol-latest:auto", models);
+			expect(result.model?.id).toBe("gpt-6.1-sol");
+			expect(result.thinkingLevel).toBe("auto");
+			expect(result.explicitThinkingLevel).toBe(true);
+		});
+
+		test("latest families preserve aggregator routing and explicit effort", () => {
+			const models = [
+				createOpusModel("openrouter", "anthropic/claude-opus-5", "Older"),
+				createOpusModel("openrouter", "anthropic/claude-opus-5.5", "Newer"),
+			];
+			const result = parseModelPattern("openrouter/opus-latest@anthropic:high", models);
+			expect(result.model?.id).toBe("anthropic/claude-opus-5.5");
+			expect(result.model?.provider).toBe("openrouter");
+			expect(result.upstream).toBe("anthropic");
+			expect(result.thinkingLevel).toBe(Effort.High);
+			expect(result.explicitThinkingLevel).toBe(true);
+		});
+
+		test("provider family shorthand outgrows a legacy provider alias pin", () => {
+			const models = [
+				createOpusModel("devin", "claude-opus-5", "Older"),
+				createOpusModel("devin", "claude-opus-5-5", "Newer"),
+			];
+			expect(parseModelPattern("devin/opus", models).model?.id).toBe("claude-opus-5-5");
+			expect(parseModelPattern("devin/claude-opus-5", models).model?.id).toBe("claude-opus-5");
+			const cli = resolveCliModel({
+				cliModel: "devin/opus",
+				modelRegistry: { getAll: () => models, getAvailable: () => models },
+			});
+			expect(cli.model?.id).toBe("claude-opus-5-5");
+			const providerFlag = resolveCliModel({
+				cliProvider: "devin",
+				cliModel: "opus",
+				modelRegistry: { getAll: () => models, getAvailable: () => models },
+			});
+			expect(providerFlag.model?.id).toBe("claude-opus-5-5");
+		});
+
+		test("numbered family revisions outrank unversioned catalog aliases", () => {
+			const models = [
+				createOpusModel("anthropic", "claude-opus-latest", "Alias"),
+				createOpusModel("anthropic", "claude-opus-5-5", "Numbered"),
+			];
+			expect(parseModelPattern("opus-latest", models).model?.id).toBe("claude-opus-5-5");
+		});
+	});
+
 	describe("patterns with valid thinking levels", () => {
 		test("all valid thinking levels work", () => {
 			const levels = [

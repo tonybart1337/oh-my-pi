@@ -783,12 +783,15 @@ describe("persisted subagent revival", () => {
 		const revivedSettings = capturedOptions?.settings;
 		if (!revivedSettings) throw new Error("Expected revived child settings");
 		const grok = getBundledModel("xai-oauth", "grok-4.7");
+		const fallbackModels = [grok, getBundledModel("openai", "gpt-4o-mini")];
 		const context: RetryFallbackResolutionContext = {
 			chains: getRetryFallbackChains(revivedSettings),
 			getModelRole: role => revivedSettings.getModelRole(role),
 			modelLookup: {
-				find: (provider, id) => (provider === grok.provider && id === grok.id ? grok : undefined),
-				hasProvider: provider => provider === grok.provider,
+				find: (provider, id) => fallbackModels.find(model => model.provider === provider && model.id === id),
+				hasProvider: provider => fallbackModels.some(model => model.provider === provider),
+				getProviderModels: provider => fallbackModels.filter(model => model.provider === provider),
+				getAll: () => fallbackModels,
 			},
 		};
 		const live = "xai-oauth/grok-4.7:xhigh";

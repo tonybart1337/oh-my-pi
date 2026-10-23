@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 import type { Model, ModelKind } from "@oh-my-pi/pi-catalog/types";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
@@ -15,6 +17,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 function createContext(
 	chains: RetryFallbackResolutionContext["chains"],
 	roles: Record<string, string> = {},
+	extraModels: Model[] = [],
 ): RetryFallbackResolutionContext {
 	const models = [
 		getBundledModel("google", "gemini-3.5-flash"),
@@ -22,6 +25,7 @@ function createContext(
 		getBundledModel("openrouter", "google/gemini-3.5-flash"),
 		getBundledModel("openai", "gpt-4o-mini"),
 		getBundledModel("xai-oauth", "grok-4.7"),
+		...extraModels,
 	].filter(model => model !== undefined);
 	return {
 		chains,
@@ -29,8 +33,16 @@ function createContext(
 		modelLookup: {
 			find: (provider, id) => models.find(model => model.provider === provider && model.id === id),
 			hasProvider: provider => models.some(model => model.provider === provider),
+			getProviderModels: provider => models.filter(model => model.provider === provider),
+			getAll: () => models,
 		},
 	};
+}
+
+function solModel(id: string): Model {
+	const base = getBundledModel("openai", "gpt-4o-mini");
+	if (!base) throw new Error("Expected bundled OpenAI test model");
+	return buildModel({ ...base, provider: "agentgw-codex-main", id, name: id });
 }
 
 describe("retry fallback selector resolution", () => {
@@ -67,6 +79,75 @@ describe("retry fallback selector resolution", () => {
 
 		const defaultContext = createContext({ default: ["openai/gpt-4o-mini"] });
 		expect(resolveRetryFallbackChainKey(defaultContext, selector)).toBe("default");
+	});
+
+	it("chooses the most specific model-id glob but lets exact model keys override it", () => {
+		const selector = "agentgw-claude-main/claude-opus-5-5:high";
+		const chains = {
+			"agentgw-claude-main/*": ["openai/gpt-4o-mini"],
+			"agentgw-claude-main/*opus*": ["google/gemini-3.5-flash"],
+			"agentgw-claude-main/*opus-5*": ["google-vertex/*"],
+			"agentgw-codex-main/*sol*": ["openai/gpt-4o-mini"],
+		};
+		const context = createContext(chains);
+		expect(resolveRetryFallbackChainKey(context, selector)).toBe("agentgw-claude-main/*opus-5*");
+		expect(resolveRetryFallbackChainKey(context, "agentgw-codex-main/gpt-6.2-sol:auto")).toBe(
+			"agentgw-codex-main/*sol*",
+		);
+		expect(resolveRetryFallbackChainKey(context, "other/claude-opus-5-5")).toBeUndefined();
+		context.chains["agentgw-claude-main/claude-opus-5-5"] = ["openai/gpt-4o-mini"];
+		expect(resolveRetryFallbackChainKey(context, selector)).toBe("agentgw-claude-main/claude-opus-5-5");
+	});
+
+	it("resolves latest-family targets to concrete newest candidates without dropping auto or unpinning exact targets", () => {
+		const old = solModel("gpt-6.1-sol");
+		const latest = solModel("gpt-6.2-sol");
+		const key = "agentgw-claude-main/*opus*";
+		const context = createContext(
+			{ [key]: ["agentgw-codex-main/sol-latest:auto", "agentgw-codex-main/gpt-6.1-sol:low"] },
+			{},
+			[old, latest],
+		);
+		const candidates = findRetryFallbackCandidates(context, key, "agentgw-claude-main/claude-opus-5-5:high");
+		expect(candidates.map(candidate => [candidate.provider, candidate.id, candidate.thinkingLevel])).toEqual([
+			[latest.provider, latest.id, AUTO_THINKING],
+			[old.provider, old.id, ThinkingLevel.Low],
+		]);
+		expect(candidates.map(candidate => candidate.raw)).toEqual([
+			"agentgw-codex-main/gpt-6.2-sol:auto",
+			"agentgw-codex-main/gpt-6.1-sol:low",
+		]);
+	});
+
+	it("skips an unavailable family instead of substituting a different family and still resolves bare family targets", () => {
+		const latest = solModel("gpt-6.2-sol");
+		const context = createContext({ default: ["agentgw-codex-main/luna-latest:auto", "sol:auto"] }, {}, [latest]);
+		expect(
+			findRetryFallbackCandidates(context, "default", "openai/gpt-4o-mini").map(candidate => candidate.raw),
+		).toEqual(["agentgw-codex-main/gpt-6.2-sol:auto"]);
+	});
+
+	it("matches roles assigned a latest family when the active selector is its concrete revision", () => {
+		const latest = solModel("gpt-6.2-sol");
+		const context = createContext({ task: ["openai/gpt-4o-mini"] }, { task: "agentgw-codex-main/sol-latest:auto" }, [
+			latest,
+		]);
+		expect(resolveRetryFallbackChainKey(context, "agentgw-codex-main/gpt-6.2-sol:auto", latest)).toBe("task");
+	});
+
+	it("validates family and glob selectors through resolution and warns only for unavailable targets", () => {
+		const latest = solModel("gpt-6.2-sol");
+		const chains = {
+			"agentgw-codex-main/*sol*": ["agentgw-codex-main/sol-latest:auto", "sol:auto"],
+			"agentgw-codex-main/sol-latest:auto": ["agentgw-codex-main/luna-latest:auto"],
+		};
+		const context = createContext(chains, {}, [latest]);
+		const warnings: string[] = [];
+		validateRetryFallbackChains(Settings.isolated({ "retry.fallbackChains": chains }), context.modelLookup, warning =>
+			warnings.push(warning),
+		);
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain("agentgw-codex-main/luna-latest:auto");
 	});
 
 	it("does not let a later shared-assignment role steal the default chain", () => {
@@ -121,6 +202,15 @@ describe("retry fallback selector resolution", () => {
 				thinkingLevel: undefined,
 			},
 		]);
+	});
+
+	it("keeps provider swaps and provider-prefix swaps for wildcard entries", () => {
+		const context = createContext({ "google/*": ["google-vertex/*", "openrouter/google/*"] });
+		expect(
+			findRetryFallbackCandidates(context, "google/*", "google/gemini-3.5-flash:high").map(
+				candidate => candidate.raw,
+			),
+		).toEqual(["google-vertex/gemini-3.5-flash", "openrouter/google/gemini-3.5-flash"]);
 	});
 
 	it("carries per-entry thinking levels while bare entries inherit", () => {
