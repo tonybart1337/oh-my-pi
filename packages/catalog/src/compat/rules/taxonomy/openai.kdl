@@ -18,6 +18,13 @@ class "openai" {
 	family "chatgpt" glob="chatgpt-*"
 	family "gpt-image" glob="gpt-image-*"
 	family "gpt-image" glob="chatgpt-image-*"
+	// Named GPT lanes track independent latest-family selectors across revisions.
+	family "sol" glob="gpt-*-sol"
+	family "sol" glob="gpt-*-sol-*"
+	family "terra" glob="gpt-*-terra"
+	family "terra" glob="gpt-*-terra-*"
+	family "luna" glob="gpt-*-luna"
+	family "luna" glob="gpt-*-luna-*"
 	family "o-series" glob="o1"
 	family "o-series" glob="o1-*"
 	family "o-series" glob="o1.*"

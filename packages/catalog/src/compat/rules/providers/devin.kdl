@@ -103,6 +103,21 @@ provider "devin" {
 				cache-write-rate 1.25
 			}
 		}
+		family "sol" {
+			revision ">=5.6 <7" {
+				cache-write-rate 1.25
+			}
+		}
+		family "terra" {
+			revision ">=5.6 <7" {
+				cache-write-rate 1.25
+			}
+		}
+		family "luna" {
+			revision ">=5.6 <7" {
+				cache-write-rate 1.25
+			}
+		}
 	}
 	// residue: Adaptive is a router uid with no model identity; its card
 	// bills cache writes at the input rate.
@@ -129,6 +144,51 @@ provider "devin" {
 					output-multiplier 1.5
 				}
 				// mini and nano share the class rank but have no published tier.
+				models token="mini" {
+					long-context-cost {}
+				}
+				models token="nano" {
+					long-context-cost {}
+				}
+			}
+		}
+		family "sol" {
+			revision ">=6 <7" {
+				long-context-cost {
+					input-threshold 272000
+					multiplier 2.0
+					output-multiplier 1.5
+				}
+				models token="mini" {
+					long-context-cost {}
+				}
+				models token="nano" {
+					long-context-cost {}
+				}
+			}
+		}
+		family "terra" {
+			revision ">=6 <7" {
+				long-context-cost {
+					input-threshold 272000
+					multiplier 2.0
+					output-multiplier 1.5
+				}
+				models token="mini" {
+					long-context-cost {}
+				}
+				models token="nano" {
+					long-context-cost {}
+				}
+			}
+		}
+		family "luna" {
+			revision ">=6 <7" {
+				long-context-cost {
+					input-threshold 272000
+					multiplier 2.0
+					output-multiplier 1.5
+				}
 				models token="mini" {
 					long-context-cost {}
 				}

@@ -214,6 +214,53 @@ describe("advisor auto thinking level", () => {
 		expect(s.getAdvisorAgent()).toBe(advisor);
 	});
 
+	it("an auto advisor on a bare retry-fallback entry inherits auto and keeps following the primary", async () => {
+		const primary = createMockModel({ handler: { content: ["primary complete"] } });
+		const advisorMock = createMockModel();
+		const wire: string[] = [];
+		let quotaFailed = false;
+		const s = newSession(
+			primary.stream,
+			{
+				"advisor.syncBacklog": "1",
+				"retry.baseDelayMs": 5,
+				"retry.fallbackRevertPolicy": "never",
+				"retry.fallbackChains": { advisor: ["google/gemini-2.5-flash"] },
+			},
+			(m, context, options) => {
+				wire.push(`${m.id}:${options?.reasoning}`);
+				if (m.id === model.id && !quotaFailed) {
+					quotaFailed = true;
+					advisorMock.push({
+						throw: "Devin stream error failed_precondition: Your daily usage quota has been exhausted. Your quota will reset after 60s.",
+					});
+				} else {
+					advisorMock.push({ content: ["advisor ok"] });
+				}
+				return advisorMock.stream(m, context, options);
+			},
+		);
+		vi.spyOn(modelRegistry.authStorage.limits, "markReached").mockResolvedValue({ switched: false });
+		s.setThinkingLevel(Effort.Low);
+		expect(s.setAdvisorEnabled(true)).toBe(true);
+		const advisor = s.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor Agent to be live");
+		const fellBack = Promise.withResolvers<void>();
+		s.subscribe(event => {
+			if (event.type === "retry_fallback_succeeded") fellBack.resolve();
+		});
+
+		await s.agent.prompt("quota fails over to the bare fallback");
+		await fellBack.promise;
+		expect(wire).toEqual([`${model.id}:${Effort.Low}`, `gemini-2.5-flash:${Effort.Low}`]);
+
+		s.setThinkingLevel(Effort.High);
+		await s.agent.prompt("primary now high");
+		expect(await s.waitForAdvisorCatchup(5000)).toBe(true);
+		expect(wire.at(-1)).toBe(`gemini-2.5-flash:${Effort.High}`);
+		expect(s.getAdvisorAgent()).toBe(advisor);
+	});
+
 	for (const { name, unverified, revertPolicy } of [
 		{ name: "keeps following the primary with no revert", unverified: false, revertPolicy: "never" },
 		{ name: "retunes during cooldown and restores fixed effort", unverified: false, revertPolicy: "cooldown-expiry" },
