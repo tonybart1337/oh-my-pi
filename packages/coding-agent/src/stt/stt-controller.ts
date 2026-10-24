@@ -13,7 +13,7 @@ import { resolveSttModelSpec, type SttModelKey } from "./models";
 import { evaluateSubmitTrigger } from "./submit-trigger";
 import { encodePcm16Wav, floatToPcm16 } from "./wav";
 
-import { cfgSttLanguage, cfgSttSubmitTrigger } from "./settings";
+import { cfgSttLanguage, cfgSttSubmitTrigger, cfgSttWakePhrase } from "./settings";
 
 export type SttState = "idle" | "recording" | "transcribing";
 
@@ -24,6 +24,8 @@ export interface SttCallbacks {
 	onStateChange(state: SttState): void;
 	/** Keep this capture as a draft, without interpreting submit commands. */
 	manualSubmit?: boolean;
+	/** Wake listening only: false discards recognition until the host can accept a new command. */
+	acceptInput?(): boolean;
 }
 
 /** The slice of a text input the controller dictates into. */
@@ -74,6 +76,9 @@ export class STTController {
 	#streamCommitted = false;
 	#streamAbort: AbortController | null = null;
 	#streamUtterance = "";
+	#wakePhrase = "";
+	#wakeWords: string[] = [];
+	#wakeStatus = "";
 
 	// Buffered cloud capture.
 	#cloudModel: Model<Api> | null = null;
@@ -217,7 +222,21 @@ export class STTController {
 		}
 	}
 
+	#supportsWakePhrase(model: Model<Api> | undefined, options: SttCallbacks): boolean {
+		const spec = resolveSttModelSpec(model?.id);
+		if ((!model || model.api === "local-inference") && spec.engine === "sherpa" && spec.mode === "online") {
+			return true;
+		}
+		options.showWarning("Wake-phrase listening requires a local online speech-to-text model (Nemotron streaming).");
+		return false;
+	}
+
 	async #startWith(editor: SttTarget, options: SttCallbacks, signal: AbortSignal): Promise<void> {
+		const wakePhrase = options.manualSubmit ? "" : cfgSttWakePhrase.get(this.#settings).trim();
+		if (wakePhrase && !/[\p{L}\p{N}]/u.test(wakePhrase)) {
+			options.showWarning("The speech-to-text wake phrase must contain words.");
+			return;
+		}
 		const first = this.#resolveCandidate();
 		if (first?.replaces) {
 			options.showWarning(
@@ -232,6 +251,7 @@ export class STTController {
 			if (qualified) options.showWarning(`Dictation model ${qualified} not found; using the built-in local model`);
 		}
 		let model = first?.model;
+		if (wakePhrase && !this.#supportsWakePhrase(model, options)) return;
 		if (model?.api === "openai-transcriptions") {
 			this.#startBuffered(editor, options, model);
 			return;
@@ -244,6 +264,7 @@ export class STTController {
 		let modelKey = await this.#ensureDeps(options, this.#resolveModelKey(model), signal);
 		if (!modelKey || signal.aborted) return;
 		model = this.#resolveCandidate()?.model;
+		if (wakePhrase && !this.#supportsWakePhrase(model, options)) return;
 		if (model?.api === "openai-transcriptions") {
 			this.#startBuffered(editor, options, model);
 			return;
@@ -257,7 +278,7 @@ export class STTController {
 			modelKey = await this.#ensureDeps(options, startModelKey, signal);
 			if (!modelKey || signal.aborted) return;
 		}
-		await this.#startStreaming(editor, options, modelKey);
+		await this.#startStreaming(editor, options, modelKey, wakePhrase);
 	}
 
 	async #stop(options: SttCallbacks): Promise<void> {
@@ -391,22 +412,75 @@ export class STTController {
 		return this.#streamCommitted ? ` ${normalized}` : normalized;
 	}
 
-	async #startStreaming(editor: SttTarget, options: SttCallbacks, modelKey: SttModelKey): Promise<void> {
-		const language = cfgSttLanguage.get(this.#settings);
-		this.#streamEditor = editor;
-		this.#streamCallbacks = options;
-		this.#streamCommitted = false;
-		this.#streamUtterance = "";
-		this.#streamAbort = new AbortController();
+	/** Match complete normalized words at the prefix, retaining the command's original spelling. */
+	#stripWakePhrase(text: string): string | null {
+		let index = 0;
+		for (const word of text.matchAll(/[\p{L}\p{N}]+/gu)) {
+			if (word[0].normalize("NFKC").toLowerCase() !== this.#wakeWords[index]) return null;
+			if (++index === this.#wakeWords.length) {
+				return text.slice(word.index + word[0].length).replace(/^[\s\p{P}\p{S}]+/u, "").trim();
+			}
+		}
+		return null;
+	}
+
+	#showWakeStatus(message: string): void {
+		if (message === this.#wakeStatus) return;
+		this.#wakeStatus = message;
+		this.#streamCallbacks?.showStatus(message);
+	}
+
+	#wakeListeningStatus(): string {
+		return `Microphone on · listening for “${this.#wakePhrase} …”`;
+	}
+
+	#acceptWakeInput(): boolean {
+		if (this.#streamCallbacks?.acceptInput?.() !== false) return true;
+		// Drop the native utterance as well as any in-flight text, so resuming cannot
+		// complete assistant echo or a command spoken while the host was busy.
+		const stream = this.#stream;
+		this.#stream = null;
+		stream?.cancel();
+		this.#showWakeStatus("Microphone on · wake listening paused while input is unavailable");
+		return false;
+	}
+
+	#openStream(modelKey: SttModelKey, language: string): SttStreamHandle {
 		const stream = sttClient.startStream(modelKey, {
 			language: language || undefined,
-			signal: this.#streamAbort.signal,
+			signal: this.#streamAbort?.signal,
+			discardTranscript: this.#wakeWords.length > 0,
 			onPartial: text => {
-				if (this.#disposed || this.#state !== "recording") return;
+				if (this.#disposed || this.#stream !== stream || this.#state !== "recording") return;
+				if (this.#wakeWords.length > 0) {
+					if (!this.#acceptWakeInput()) return;
+					this.#showWakeStatus(
+						this.#stripWakePhrase(text) === null
+							? this.#wakeListeningStatus()
+							: "Microphone on · wake phrase detected; listening for command",
+					);
+					return;
+				}
 				this.#streamEditor?.setVolatileText(this.#prefixed(text));
 			},
 			onSegment: text => {
-				if (this.#disposed) return;
+				if (this.#disposed || this.#stream !== stream) return;
+				if (this.#wakeWords.length > 0) {
+					if (this.#state !== "recording" || !this.#acceptWakeInput()) return;
+					// A fresh command must not inherit the previous utterance's native
+					// decoder/cache context, including discarded ambient speech.
+					this.#stream = null;
+					stream.cancel();
+					const command = this.#stripWakePhrase(text);
+					// Never write partials, ambient speech, or the phrase alone into a
+					// typed draft. Every endpoint must address a fresh command.
+					if (command) {
+						this.#streamEditor?.commitVolatileText(command);
+						this.#streamEditor?.submit();
+					}
+					if (this.#acceptWakeInput()) this.#showWakeStatus(this.#wakeListeningStatus());
+					return;
+				}
 				const prefixed = this.#prefixed(text);
 				if (prefixed) {
 					this.#streamEditor?.commitVolatileText(prefixed);
@@ -417,11 +491,29 @@ export class STTController {
 				}
 			},
 		});
-		this.#stream = stream;
+		return stream;
+	}
+
+	async #startStreaming(
+		editor: SttTarget,
+		options: SttCallbacks,
+		modelKey: SttModelKey,
+		wakePhrase: string,
+	): Promise<void> {
+		const language = cfgSttLanguage.get(this.#settings);
+		this.#streamEditor = editor;
+		this.#streamCallbacks = options;
+		this.#streamCommitted = false;
+		this.#streamUtterance = "";
+		const abort = new AbortController();
+		this.#streamAbort = abort;
+		this.#wakePhrase = wakePhrase;
+		this.#wakeWords = wakePhrase.normalize("NFKC").toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+		this.#stream = this.#openStream(modelKey, language);
 		let recorder: CaptureHandle;
 		try {
 			recorder = this.#createCapture((error, samples) => {
-				if (this.#disposed || this.#stream !== stream || this.#state !== "recording") return;
+				if (this.#disposed || this.#streamAbort !== abort || this.#state !== "recording") return;
 				if (error) {
 					logger.error("Native microphone capture failed", { error: error.message });
 					const activeRecorder = this.#streamRecorder;
@@ -434,17 +526,24 @@ export class STTController {
 						});
 					}
 					this.#streamAbort?.abort(error);
-					stream.cancel();
-					this.#streamEditor?.clearVolatileText();
+					this.#stream?.cancel();
+					if (this.#wakeWords.length === 0) this.#streamEditor?.clearVolatileText();
 					this.#cleanupStream();
 					this.#setState("idle", options);
 					options.showWarning(error.message);
 					return;
 				}
-				stream.pushAudio(samples);
+				if (this.#wakeWords.length > 0) {
+					if (!this.#acceptWakeInput()) return;
+					if (!this.#stream) {
+						this.#stream = this.#openStream(modelKey, language);
+						this.#showWakeStatus(this.#wakeListeningStatus());
+					}
+				}
+				this.#stream?.pushAudio(samples);
 			});
 		} catch (err) {
-			stream.cancel();
+			this.#stream?.cancel();
 			this.#cleanupStream();
 			const msg = err instanceof Error ? err.message : "Failed to start microphone capture";
 			options.showWarning(msg);
@@ -453,12 +552,29 @@ export class STTController {
 		}
 		this.#streamRecorder = recorder;
 		this.#setState("recording", options);
+		if (this.#wakeWords.length > 0 && this.#acceptWakeInput()) this.#showWakeStatus(this.#wakeListeningStatus());
 		logger.debug("STT live recording started", { modelKey });
 	}
 
 	async #stopStreaming(options: SttCallbacks): Promise<void> {
 		const stream = this.#stream;
 		const recorder = this.#streamRecorder;
+		if (this.#wakeWords.length > 0) {
+			// Toggle-off is cancellation, not an utterance endpoint: do not flush a
+			// pending command or replay the worker's joined ambient transcript.
+			this.#setState("transcribing", options);
+			try {
+				recorder?.stop();
+			} catch (err) {
+				logger.debug("stt: wake recorder stop failed", { error: String(err) });
+			}
+			this.#streamAbort?.abort();
+			stream?.cancel();
+			this.#cleanupStream();
+			this.#setState("idle", options);
+			options.showStatus("Wake-phrase listening stopped.");
+			return;
+		}
 		if (!stream) {
 			this.#setState("idle", options);
 			return;
@@ -503,6 +619,9 @@ export class STTController {
 		this.#streamCommitted = false;
 		this.#streamAbort = null;
 		this.#streamUtterance = "";
+		this.#wakePhrase = "";
+		this.#wakeWords = [];
+		this.#wakeStatus = "";
 	}
 
 	#finishTranscript(finalText: string, failed: boolean, options: SttCallbacks): void {

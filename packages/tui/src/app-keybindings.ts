@@ -456,17 +456,35 @@ export interface KeybindingsCreateOptions {
  * Load raw config from a file synchronously.
  * Returns parsed JSON/YAML or null if file doesn't exist or is invalid.
  */
-function loadRawConfig(filePath: string): unknown {
+function loadRawConfig(filePath: string, strict = false): unknown {
 	try {
 		const content = fs.readFileSync(filePath, "utf-8");
+		let config: unknown;
 		if (filePath.endsWith(".json")) {
-			return JSONC.parse(content);
+			config = JSONC.parse(content);
+		} else if (filePath.endsWith(".yml") || filePath.endsWith(".yaml")) {
+			config = YAML.parse(content);
+		} else {
+			throw new Error(`Unsupported keybindings config extension: ${filePath}`);
 		}
-		if (filePath.endsWith(".yml") || filePath.endsWith(".yaml")) {
-			return YAML.parse(content);
+		if (
+			strict &&
+			(typeof config !== "object" ||
+				config === null ||
+				Array.isArray(config) ||
+				Object.values(config).some(value =>
+					typeof value !== "string" && !(Array.isArray(value) && value.every(key => typeof key === "string")),
+				))
+		) {
+			throw new Error("Expected a mapping of keybinding names to keys or key arrays");
 		}
-		throw new Error(`Unsupported keybindings config extension: ${filePath}`);
+		return config;
 	} catch (error) {
+		if (strict) {
+			throw new Error(`Failed to load keybindings config from PI_KEYBINDINGS_FILE (${filePath}): ${String(error)}`, {
+				cause: error,
+			});
+		}
 		if (isEnoent(error)) {
 			return null;
 		}
@@ -554,11 +572,12 @@ function loadMergedKeybindingsConfig(
 function loadKeybindingsConfig(
 	filePath: string,
 	writeBackPath: string | undefined,
+	strict = false,
 ): {
 	config: KeybindingsConfig;
 	persistedPath: string;
 } {
-	const rawConfig = loadRawConfig(filePath);
+	const rawConfig = loadRawConfig(filePath, strict);
 
 	if (rawConfig === null) {
 		return { config: {}, persistedPath: filePath };
@@ -627,6 +646,7 @@ function keyConfigValue(keys: KeyId[]): KeyId | KeyId[] {
 export class KeybindingsManager extends TuiKeybindingsManager {
 	#configPath: string | undefined;
 	#inheritedConfigPath: string | undefined;
+	#overlayConfigPath: string | undefined;
 	#userBindings: KeybindingsConfig;
 
 	constructor(userBindings: KeybindingsConfig = {}, configPath?: string, inheritedConfigPath?: string) {
@@ -641,8 +661,15 @@ export class KeybindingsManager extends TuiKeybindingsManager {
 	 * Legacy keybindings.json is migrated to keybindings.yml on load.
 	 */
 	static create(agentDir: string = getAgentDir(), options: KeybindingsCreateOptions = {}): KeybindingsManager {
+		const overlayPath = process.env.PI_KEYBINDINGS_FILE;
+		const overlayConfig = overlayPath ? loadKeybindingsConfig(overlayPath, undefined, true).config : {};
 		const { config: userBindings, profilePath, inheritedPath } = loadMergedKeybindingsConfig(agentDir, options);
-		const manager = new KeybindingsManager(userBindings, profilePath, inheritedPath);
+		const manager = new KeybindingsManager(
+			mergeKeybindingsConfig(userBindings, overlayConfig),
+			profilePath,
+			inheritedPath,
+		);
+		manager.#overlayConfigPath = overlayPath;
 		// Set globally so getKeybindings() returns this manager
 		setKeybindings(manager);
 		return manager;
@@ -664,7 +691,10 @@ export class KeybindingsManager extends TuiKeybindingsManager {
 			? KeybindingsManager.#loadFromFile(this.#inheritedConfigPath)
 			: { config: {} };
 		const { config: profileConfig } = KeybindingsManager.#loadFromFile(this.#configPath);
-		this.setUserBindings(mergeKeybindingsConfig(inheritedConfig, profileConfig));
+		const overlayConfig = this.#overlayConfigPath
+			? loadKeybindingsConfig(this.#overlayConfigPath, undefined, true).config
+			: {};
+		this.setUserBindings(mergeKeybindingsConfig(mergeKeybindingsConfig(inheritedConfig, profileConfig), overlayConfig));
 	}
 
 	override setUserBindings(userBindings: KeybindingsConfig): void {
