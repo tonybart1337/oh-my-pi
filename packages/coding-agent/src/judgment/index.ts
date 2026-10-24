@@ -80,9 +80,17 @@ export interface JudgmentUsage {
 	errorMessage?: string;
 }
 
+/** Credential and catalog surface shared by judgment consumers. */
+export type JudgeRegistry = Pick<
+	ModelRegistry,
+	"getAvailable" | "getAll" | "getError" | "getApiKey" | "resolver" | "resolveModelHeaders"
+>;
+
 export interface JudgeDeps {
 	settings: Settings;
-	registry: ModelRegistry;
+	registry: JudgeRegistry;
+	/** Feature-specific primary selector; judge role fallback policy remains in force. */
+	selector?: string;
 	/** The session's active model, appended when the judge role does not already route to it. */
 	sessionModel?: Model;
 	sessionId?: string;
@@ -162,7 +170,7 @@ const CANDIDATE_TTL_MS = 1_000;
 const kRejections = Symbol("judgment.rejections");
 /** Last resolved judge role chain, carried by the registry it was drawn from. */
 const kRoleChain = Symbol("judgment.roleChain");
-interface RegistryWithRejections extends ModelRegistry {
+interface RegistryWithRejections extends JudgeRegistry {
 	[kRejections]?: Map<string, number>;
 	[kRoleChain]?: {
 		settings: Settings;
@@ -338,7 +346,7 @@ function unfitBox(box: BoxEdges, content: BoxEdges): BoxEdges {
 	return { top: y(box.top), bottom: y(box.bottom), left: x(box.left), right: x(box.right) };
 }
 
-function judgeRoleChain(settings: Settings, registry: ModelRegistry): RoleChainCandidate[] {
+function judgeRoleChain(settings: Settings, registry: JudgeRegistry): RoleChainCandidate[] {
 	return textJudgeRoleChain(resolveRoleChain("judge", settings, roleCandidatePool("judge", settings, registry)));
 }
 
@@ -348,7 +356,7 @@ function judgeRoleChain(settings: Settings, registry: ModelRegistry): RoleChainC
  * prompted on-device or chat model. Judge-heavy features gate on it, e.g. the `find`
  * tool under `find.enabled: auto`.
  */
-export function hasNativeJudge(settings: Settings, registry: ModelRegistry): boolean {
+export function hasNativeJudge(settings: Settings, registry: JudgeRegistry): boolean {
 	const [primary] = judgeRoleChain(settings, registry);
 	return primary !== undefined && kindOf(primary) === "native";
 }
@@ -521,8 +529,13 @@ export class ChainJudge implements Judge {
 	}
 
 	#resolveCandidates(request?: JudgmentRequest): RoleChainCandidate[] {
-		const { settings, registry, sessionModel } = this.#deps;
-		const { roleChain, list: chain } = cachedJudgeRoleChain(settings, registry);
+		const { settings, registry, sessionModel, selector } = this.#deps;
+		const resolved = selector
+			? resolveRoleChain("judge", settings, roleCandidatePool("judge", settings, registry), selector)
+			: undefined;
+		const { roleChain, list: chain } = resolved
+			? { roleChain: resolved, list: textJudgeRoleChain(resolved) }
+			: cachedJudgeRoleChain(settings, registry);
 		const images = request?.images ?? [];
 		// A prompted model cannot locate anything, so no session fallback either.
 		if (request && asksForBoxes(request.questions)) {
