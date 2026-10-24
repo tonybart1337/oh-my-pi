@@ -134,18 +134,58 @@ function orderConfig(config: KeybindingsConfig): KeybindingsConfig {
 	return ordered;
 }
 
+/** `filePath` parsed by its extension (JSONC, YAML); throws on read and syntax errors. */
+function parseConfigFile(filePath: string): unknown {
+	const content = fs.readFileSync(filePath, "utf-8");
+	if (filePath.endsWith(".json")) return JSONC.parse(content);
+	if (filePath.endsWith(".yml") || filePath.endsWith(".yaml")) return YAML.parse(content);
+	throw new Error(`Unsupported keybindings config extension: ${filePath}`);
+}
+
 /** The parsed file, or null when it is missing or unreadable (logged). */
 function readRawConfig(filePath: string): unknown {
 	try {
-		const content = fs.readFileSync(filePath, "utf-8");
-		if (filePath.endsWith(".json")) return JSONC.parse(content);
-		if (filePath.endsWith(".yml") || filePath.endsWith(".yaml")) return YAML.parse(content);
-		throw new Error(`Unsupported keybindings config extension: ${filePath}`);
+		return parseConfigFile(filePath);
 	} catch (error) {
 		if (isEnoent(error)) return null;
 		logger.warn("Failed to parse keybindings config", { path: filePath, error: String(error) });
 		return null;
 	}
+}
+
+/** Names the optional read-only per-process overlay applied over inherited and profile bindings. */
+export const KEYBINDINGS_OVERLAY_ENV = "PI_KEYBINDINGS_FILE";
+
+/**
+ * The explicit per-process overlay ({@link KEYBINDINGS_OVERLAY_ENV}): old action
+ * names migrate in memory and the file is never rewritten. Unlike the profile
+ * files, a missing, unreadable or malformed overlay throws a path-qualified
+ * error instead of silently leaving the defaults in place.
+ */
+export function loadKeybindingsOverlay(filePath: string): KeybindingsConfig {
+	let raw: unknown;
+	try {
+		raw = parseConfigFile(filePath);
+		if (
+			typeof raw !== "object" ||
+			raw === null ||
+			Array.isArray(raw) ||
+			Object.values(raw).some(
+				value =>
+					typeof value !== "string" && !(Array.isArray(value) && value.every(key => typeof key === "string")),
+			)
+		) {
+			throw new Error("Expected a mapping of keybinding names to keys or key arrays");
+		}
+	} catch (error) {
+		throw new Error(
+			`Failed to load keybindings config from ${KEYBINDINGS_OVERLAY_ENV} (${filePath}): ${String(error)}`,
+			{
+				cause: error,
+			},
+		);
+	}
+	return migrateNames(raw).config;
 }
 
 function writeConfig(filePath: string, config: KeybindingsConfig): boolean {

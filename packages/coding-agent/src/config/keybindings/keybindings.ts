@@ -7,10 +7,12 @@ import { setWidgetKeymap, type WidgetAction, type WidgetKeymap } from "@oh-my-pi
 import { getAgentDir } from "@oh-my-pi/pi-utils/dirs";
 import { KEYBINDINGS, type Keybinding } from "./app-keybindings";
 import {
+	KEYBINDINGS_OVERLAY_ENV,
 	type KeybindingsConfig,
 	type KeybindingsCreateOptions,
 	loadKeybindingsConfig,
 	loadKeybindingsFile,
+	loadKeybindingsOverlay,
 	mergeKeybindingsConfig,
 } from "./config-file";
 import { canonicalKeyId, type KeyId } from "./key-id";
@@ -84,6 +86,8 @@ export class KeybindingsManager {
 	#userBindings: KeybindingsConfig;
 	readonly #configPath: string | undefined;
 	readonly #inheritedConfigPath: string | undefined;
+	/** The per-process overlay ({@link KEYBINDINGS_OVERLAY_ENV}) applied over the files; kept for reloads. */
+	#overlayConfigPath: string | undefined;
 	readonly #keys = new Map<Keybinding, KeyId[]>();
 	/** Event ids each action answers to. */
 	readonly #ids = new Map<Keybinding, Set<string>>();
@@ -98,12 +102,16 @@ export class KeybindingsManager {
 
 	/**
 	 * Load the bindings for `agentDir` (merged over the default profile's under
-	 * a named profile), migrating legacy files, and make the result the global
-	 * keymap ({@link getKeybindings}).
+	 * a named profile), migrating legacy files, then the read-only per-process
+	 * overlay `PI_KEYBINDINGS_FILE` names (when set) over both, and make the
+	 * result the global keymap ({@link getKeybindings}).
 	 */
 	static create(agentDir: string = getAgentDir(), options: KeybindingsCreateOptions = {}): KeybindingsManager {
+		const overlayPath = process.env[KEYBINDINGS_OVERLAY_ENV] || undefined;
+		const overlay = overlayPath ? loadKeybindingsOverlay(overlayPath) : {};
 		const { config, profilePath, inheritedPath } = loadKeybindingsConfig(agentDir, options);
-		const manager = new KeybindingsManager(config, profilePath, inheritedPath);
+		const manager = new KeybindingsManager(mergeKeybindingsConfig(config, overlay), profilePath, inheritedPath);
+		manager.#overlayConfigPath = overlayPath;
 		setKeybindings(manager);
 		return manager;
 	}
@@ -113,11 +121,13 @@ export class KeybindingsManager {
 		return new KeybindingsManager(userBindings);
 	}
 
-	/** Re-read the config files this keymap was created from (no-op for in-memory keymaps). */
+	/** Re-read the config files (and overlay) this keymap was created from (no-op for in-memory keymaps). */
 	reload(): void {
 		if (!this.#configPath) return;
 		const inherited = this.#inheritedConfigPath ? loadKeybindingsFile(this.#inheritedConfigPath).config : {};
-		this.setUserBindings(mergeKeybindingsConfig(inherited, loadKeybindingsFile(this.#configPath).config));
+		const overlay = this.#overlayConfigPath ? loadKeybindingsOverlay(this.#overlayConfigPath) : {};
+		const files = mergeKeybindingsConfig(inherited, loadKeybindingsFile(this.#configPath).config);
+		this.setUserBindings(mergeKeybindingsConfig(files, overlay));
 	}
 
 	setUserBindings(userBindings: KeybindingsConfig): void {

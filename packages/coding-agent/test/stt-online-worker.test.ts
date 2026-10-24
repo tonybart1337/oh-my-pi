@@ -201,6 +201,20 @@ describe("native online STT worker", () => {
 		expect(stream.pending).toEqual([]);
 	});
 
+	it("emits continuous endpoints without retaining or replaying ambient transcripts on Stop", async () => {
+		const h = harness();
+		h.send({ type: "stream_start", id: "private", modelKey: key, discardTranscript: true });
+		h.send({ type: "stream_audio", id: "private", audio: Float32Array.of(1, -1, 2, -1, 3) });
+		await h.waitFor("segment", "private");
+		h.send({ type: "stream_stop", id: "private" });
+		expect(await h.waitFor("stream_done", "private")).toEqual({ type: "stream_done", id: "private", text: "" });
+		expect(h.events.filter(event => event.type === "segment")).toEqual([
+			{ type: "segment", id: "private", index: 0, text: "hello" },
+			{ type: "segment", id: "private", index: 1, text: "world" },
+			{ type: "segment", id: "private", index: 2, text: "tail" },
+		]);
+	});
+
 	it("buffers startup audio and Stop while model files are loading", async () => {
 		const entered = Promise.withResolvers<void>();
 		const loaded = Promise.withResolvers<undefined>();

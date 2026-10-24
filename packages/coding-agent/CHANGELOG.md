@@ -45,6 +45,8 @@
 ### Added
 
 - Added provider-scoped model-ID glob keys in retry fallback chains, with ordinary latest-family and effort selectors as fallback targets
+- Added opt-in local `stt.wakePhrase` listening: explicitly arm Nemotron dictation, address each utterance with a phrase, and submit only the stripped command; ambient, busy/echoed, and cancelled speech is discarded
+- Added the read-only `PI_KEYBINDINGS_FILE` per-process keybindings overlay for dedicated chat controls without modifying profile keybindings
 
 ### Fixed
 

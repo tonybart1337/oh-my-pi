@@ -368,7 +368,7 @@ import { cfgGoalContinuationModes, cfgGoalEnabled } from "../goals/settings";
 import { goalContinuationActivity, goalFromModeData } from "../goals/state";
 import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "../plan-mode/settings";
 import { cfgStreamRedactPatterns } from "../stream/settings";
-import { cfgSttEnabled } from "../stt/settings";
+import { cfgSttEnabled, cfgSttWakePhrase } from "../stt/settings";
 import { combine, type SettingValueOf } from "../config/registry";
 import { cfgAdvisorEnabled, cfgAdvisorMaxNotesPerUpdate } from "../advisor/settings";
 import { cfgExtensionAssistantTextRenderers, cfgExtensionTranscriptPresenters } from "../extensibility/settings";
@@ -7981,7 +7981,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#dictationStarting = true;
 		if (this.#frame.dictation.peek() !== undefined) this.#frame.dictation.set("starting");
 		try {
-			await controller.start(this.composer, { ...this.#dictationCallbacks(this.composer), manualSubmit: true });
+			await controller.start(this.composer, this.#dictationCallbacks(this.composer, true));
 		} finally {
 			this.#dictationStarting = false;
 			// A start that failed or was cancelled reports no state of its own.
@@ -8019,13 +8019,22 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	/** Callbacks for a capture dictating into `target`: the mic glyph replaces its cursor while the
 	 *  capture runs. */
-	#dictationCallbacks(target: DictationTarget): SttCallbacks {
+	#dictationCallbacks(target: DictationTarget, manualSubmit = false): SttCallbacks {
+		const wakeListening = !manualSubmit && cfgSttWakePhrase.get(this.settings).trim().length > 0;
 		return {
+			manualSubmit,
+			acceptInput: () =>
+				target === this.composer &&
+				this.composer.text().length === 0 &&
+				!this.#isAutoSubmitBlocked() &&
+				!this.#pendingSubmittedInput &&
+				this.session.queuedMessageCount === 0 &&
+				!vocalizer.isSpeaking(),
 			showWarning: (msg: string) => this.showWarning(msg),
 			showStatus: (msg: string) => this.showStatus(msg),
 			onStateChange: (state: SttState) => {
-				// Duck assistant speech while the user is talking (push-to-talk); restore after.
-				if (state === "recording") vocalizer.duck();
+				// Continuous wake listening must not duck assistant speech for its lifetime.
+				if (state === "recording" && !wakeListening) vocalizer.duck();
 				else vocalizer.unduck();
 				if (this.#frame.dictation.peek() !== undefined) this.#frame.dictation.set(state);
 				if (state === "recording") {

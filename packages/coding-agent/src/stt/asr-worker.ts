@@ -449,6 +449,7 @@ interface StreamingSession {
 	pendingPartial: Float32Array | null;
 	/** Committed segment transcripts, joined for the final result. */
 	committed: string[];
+	discardTranscript: boolean;
 	segmentIndex: number;
 	pumping: boolean;
 	cancelled: boolean;
@@ -489,6 +490,7 @@ function startStreamingSession(
 		segmentQueue: [],
 		pendingPartial: null,
 		committed: [],
+		discardTranscript: request.discardTranscript ?? false,
 		segmentIndex: 0,
 		pumping: false,
 		cancelled: false,
@@ -508,7 +510,7 @@ function ingestStreamEvents(session: StreamingSession, events: EndpointerEvent[]
 
 function commitOnlineSegment(session: StreamingSession, transport: SttTransport, text: string): void {
 	if (text.length > 0) {
-		session.committed.push(text);
+		if (!session.discardTranscript) session.committed.push(text);
 		transport.send({ type: "segment", id: session.id, index: session.segmentIndex++, text });
 	}
 	session.lastPartial = "";
@@ -585,7 +587,7 @@ async function pumpSession(session: StreamingSession, transport: SttTransport): 
 				const text = await runOnModel(() => decodeSegment(model, session.spec, audio, session.language));
 				if (session.cancelled) return;
 				if (text.length > 0) {
-					session.committed.push(text);
+					if (!session.discardTranscript) session.committed.push(text);
 					transport.send({ type: "segment", id: session.id, index: session.segmentIndex++, text });
 				}
 				continue;
