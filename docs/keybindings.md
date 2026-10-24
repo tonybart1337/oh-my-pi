@@ -10,6 +10,22 @@ User remaps live in `~/.omp/agent/keybindings.yml`. The file is a YAML mapping w
 
 With a named profile, bindings from the default profile's agent directory are loaded first and the active profile's `keybindings.yml` overrides them action by action. The inherited file is read-only during that profile's startup.
 
+`PI_KEYBINDINGS_FILE=/absolute/path/keybindings.yml` adds an optional read-only
+per-process overlay after inherited and profile bindings. It is useful for a
+dedicated voice chat without changing other sessions. Missing or malformed explicit
+overlays fail with a path-qualified error. Keybinding reloads retain the same overlay.
+For press-once/start, press-again/stop dictation, use:
+
+```yaml
+app.stt.toggle: Ctrl+Space
+```
+
+With `stt.wakePhrase: "hey coach"` and local Nemotron selected, starting dictation
+arms continuous local listening. Say the phrase and command in the same utterance,
+then pause to submit. Each command needs its own phrase. Ordinary background speech
+is discarded; the phrase by itself does not arm a later utterance. Toggle again to
+release the microphone. Neither configuration nor startup turns the microphone on.
+
 ```yaml
 app.model.cycleForward: Ctrl+P
 app.model.selectTemporary: Alt+P

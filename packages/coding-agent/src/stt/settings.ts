@@ -20,6 +20,9 @@ export const cfgSttEnabled = register({
 
 export const cfgSttLanguage = register({ id: "stt.language", type: "string", default: "en" });
 
+/** Opt-in prefix-gated continuous local dictation; recording still starts explicitly. */
+export const cfgSttWakePhrase = register({ id: "stt.wakePhrase", type: "string", default: "" });
+
 export const cfgSttSubmitTrigger = register({
 	id: "stt.submitTrigger",
 	type: "enum",

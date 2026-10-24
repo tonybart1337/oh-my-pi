@@ -436,6 +436,7 @@
 ### Added
 
 - Added provider-scoped model-ID glob keys in retry fallback chains, with ordinary latest-family and effort selectors as fallback targets
+- Added opt-in local `stt.wakePhrase` listening: explicitly arm Nemotron dictation, address each utterance with a phrase, and submit only the stripped command; ambient, busy/echoed, and cancelled speech is discarded
 
 ### Fixed
 
