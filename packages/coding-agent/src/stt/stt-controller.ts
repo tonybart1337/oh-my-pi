@@ -7,13 +7,23 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { type RoleChainCandidate, resolveConfiguredModelPatterns, resolveRoleChain } from "../config/model-resolver";
 import { roleCandidatePool } from "../config/model-roles";
 import { type Settings, settings } from "../config/settings";
+import type { JudgeRegistry } from "../judgment";
 import { type SttStreamHandle, sttClient } from "./asr-client";
+import { correctTranscript } from "./correction";
 import { downloadSttModel, isSttModelCached } from "./downloader";
 import { resolveSttModelSpec, type SttModelKey } from "./models";
 import { evaluateSubmitTrigger } from "./submit-trigger";
 import { encodePcm16Wav, floatToPcm16 } from "./wav";
 
-import { cfgSttLanguage, cfgSttSubmitTrigger, cfgSttWakePhrase } from "./settings";
+import {
+	cfgSttCorrectionEnabled,
+	cfgSttCorrectionGateEnabled,
+	cfgSttCorrectionModelEnabled,
+	cfgSttLanguage,
+	cfgSttSubmitTrigger,
+	cfgSttWakePhrase,
+	cfgSttWakeTimeoutMs,
+} from "./settings";
 
 export type SttState = "idle" | "recording" | "transcribing";
 
@@ -35,6 +45,9 @@ export interface SttTarget {
 	commitVolatileText(text: string): void;
 	submit(): void;
 	deleteBeforeCursor(count: number): void;
+	/** Optional draft snapshot surface; without it review safely retains the original. */
+	getText?(): string;
+	setText?(text: string): void;
 }
 
 interface CaptureHandle {
@@ -45,6 +58,12 @@ type CaptureFactory = (onAudio: (error: Error | null, samples: Float32Array) => 
 
 interface SttRegistry extends ModelBrowserRegistry {
 	resolver(model: Model<Api>, sessionId?: string): ApiKeyResolver;
+	getApiKey?: JudgeRegistry["getApiKey"];
+	resolveModelHeaders?: JudgeRegistry["resolveModelHeaders"];
+}
+
+function supportsReview(registry: SttRegistry | undefined): registry is SttRegistry & JudgeRegistry {
+	return !!registry?.getApiKey && !!registry.resolveModelHeaders;
 }
 
 export interface STTControllerDependencies {
@@ -62,6 +81,11 @@ export class STTController {
 	/** Cancels the start in flight: its model preflight wait and whatever start step follows it. */
 	#startAbort: AbortController | null = null;
 	#disposed = false;
+	#processingTranscript = false;
+	#reviewAbort: AbortController | null = null;
+	#reviewEnabled = false;
+	#reviewSegments = "";
+	#reviewPartial = "";
 	readonly #createCapture: CaptureFactory;
 	readonly #settings: Settings;
 	readonly #registry: SttRegistry | undefined;
@@ -79,6 +103,13 @@ export class STTController {
 	#wakePhrase = "";
 	#wakeWords: string[] = [];
 	#wakeStatus = "";
+	#wakeTimeoutMs = 15_000;
+	#wakeDeadline: number | null = null;
+	#wakeTimer: Timer | undefined;
+	/** A recognized command beginning inside the window may finish after its deadline. */
+	#wakeCommandStarted = false;
+	/** Until this segment ends, a partial prefix must still be present in its final transcript. */
+	#wakePhraseInSegment = false;
 
 	// Buffered cloud capture.
 	#cloudModel: Model<Api> | null = null;
@@ -128,6 +159,7 @@ export class STTController {
 	 *  model preflight stops waiting (the worker keeps loading), otherwise it stops once it is up.
 	 *  A no-op unless starting or recording. */
 	async stop(): Promise<void> {
+		if (this.#processingTranscript) this.#reviewAbort?.abort();
 		if (this.#toggling) {
 			if (this.#state === "idle" || this.#state === "recording") this.#stopAfterStart = true;
 			if (this.#state === "idle") this.#startAbort?.abort();
@@ -232,6 +264,9 @@ export class STTController {
 	}
 
 	async #startWith(editor: SttTarget, options: SttCallbacks, signal: AbortSignal): Promise<void> {
+		this.#reviewEnabled = cfgSttCorrectionEnabled.get(this.#settings);
+		this.#reviewSegments = "";
+		this.#reviewPartial = "";
 		const wakePhrase = options.manualSubmit ? "" : cfgSttWakePhrase.get(this.#settings).trim();
 		if (wakePhrase && !/[\p{L}\p{N}]/u.test(wakePhrase)) {
 			options.showWarning("The speech-to-text wake phrase must contain words.");
@@ -386,9 +421,9 @@ export class STTController {
 			return;
 		}
 
-		this.#finishTranscript(finalText, failed, options);
+		await this.#finishTranscript(finalText, failed, options);
 		this.#cleanupCloud();
-		this.#setState("idle", options);
+		if (!this.#disposed) this.#setState("idle", options);
 	}
 
 	#cleanupCloud(): void {
@@ -412,13 +447,103 @@ export class STTController {
 		return this.#streamCommitted ? ` ${normalized}` : normalized;
 	}
 
+	#previewTranscript(text: string): void {
+		if (this.#reviewEnabled) {
+			this.#reviewPartial = text.trim();
+			return;
+		}
+		this.#streamEditor?.setVolatileText(this.#prefixed(text));
+	}
+
+	#commitTranscriptSegment(text: string): void {
+		if (this.#reviewEnabled) {
+			if (text.trim()) this.#reviewSegments += `${this.#reviewSegments ? " " : ""}${text.trim()}`;
+			this.#reviewPartial = "";
+			return;
+		}
+		const prefixed = this.#prefixed(text);
+		if (prefixed) {
+			this.#streamEditor?.commitVolatileText(prefixed);
+			this.#streamCommitted = true;
+			this.#streamUtterance += prefixed;
+		} else this.#streamEditor?.clearVolatileText();
+	}
+
+	async #deliverWakeCommand(command: string): Promise<void> {
+		const editor = this.#streamEditor;
+		const options = this.#streamCallbacks;
+		if (!editor || !options || this.#disposed || this.#processingTranscript) return;
+		if (this.#reviewEnabled) await this.#reviewDraft(command, editor, options);
+		else {
+			editor.commitVolatileText(command);
+			editor.submit();
+		}
+	}
+
+	async #reviewDraft(original: string, editor: SttTarget, options: SttCallbacks, failed = false): Promise<void> {
+		// The original is durable before any model call. Edits, Send, cancellation,
+		// and failures can never strand a transcript in an asynchronous operation.
+		const before = editor.getText?.();
+		editor.commitVolatileText(original);
+		const expected = editor.getText?.();
+		options.showStatus("Dictation draft · review and press Send.");
+		if (
+			failed ||
+			(!cfgSttCorrectionGateEnabled.get(this.#settings) && !cfgSttCorrectionModelEnabled.get(this.#settings))
+		)
+			return;
+		const abort = new AbortController();
+		this.#reviewAbort = abort;
+		this.#processingTranscript = true;
+		const sessionId = this.#getSessionId?.();
+		try {
+			const registry = this.#registry;
+			if (!supportsReview(registry)) throw new Error("Model credentials are unavailable");
+			const signal = this.#streamAbort ? AbortSignal.any([abort.signal, this.#streamAbort.signal]) : abort.signal;
+			const result = await correctTranscript(original, { settings: this.#settings, registry, sessionId, signal });
+			if (this.#disposed || signal.aborted || this.#getSessionId?.() !== sessionId || this.#streamEditor !== editor)
+				return;
+			if (result.warning) options.showWarning(result.warning);
+			const corrected = result.text;
+			if (corrected !== original) {
+				// Replace only our unchanged insertion. Never replace a user's typed,
+				// edited, submitted, or switched-away draft with a late model result.
+				let index = expected?.indexOf(original) ?? -1;
+				while (index >= 0 && expected!.slice(0, index) + expected!.slice(index + original.length) !== before) {
+					index = expected!.indexOf(original, index + 1);
+				}
+				if (index >= 0 && expected !== undefined && editor.setText && editor.getText?.() === expected) {
+					editor.setText(expected.slice(0, index) + corrected + expected.slice(index + original.length));
+				} else
+					options.showWarning(
+						"Dictation draft changed during correction; kept your draft without overwriting it.",
+					);
+			}
+			options.showStatus("Dictation draft · review and press Send.");
+		} catch (error) {
+			if (!this.#disposed && !abort.signal.aborted) {
+				options.showWarning(
+					`Dictation correction failed; original draft retained. ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		} finally {
+			if (this.#reviewAbort === abort) {
+				this.#reviewAbort = null;
+				this.#processingTranscript = false;
+			}
+		}
+	}
+
 	/** Match complete normalized words at the prefix, retaining the command's original spelling. */
 	#stripWakePhrase(text: string): string | null {
 		let index = 0;
 		for (const word of text.matchAll(/[\p{L}\p{N}]+/gu)) {
 			if (word[0].normalize("NFKC").toLowerCase() !== this.#wakeWords[index]) return null;
 			if (++index === this.#wakeWords.length) {
-				return text.slice(word.index + word[0].length).replace(/^[\s\p{P}\p{S}]+/u, "").trim();
+				return text
+					.slice(word.index + word[0].length)
+					.replace(/^[\s\p{P}\p{S}]+/u, "")
+					.trim();
 			}
 		}
 		return null;
@@ -434,13 +559,101 @@ export class STTController {
 		return `Microphone on · listening for “${this.#wakePhrase} …”`;
 	}
 
-	#acceptWakeInput(): boolean {
-		if (this.#streamCallbacks?.acceptInput?.() !== false) return true;
-		// Drop the native utterance as well as any in-flight text, so resuming cannot
-		// complete assistant echo or a command spoken while the host was busy.
+	#wakeCurrentStatus(): string {
+		return this.#wakeDeadline === null
+			? this.#wakeListeningStatus()
+			: "Microphone on · wake phrase detected; listening for command";
+	}
+
+	#resetWakeWindow(): void {
+		clearTimeout(this.#wakeTimer);
+		this.#wakeTimer = undefined;
+		this.#wakeDeadline = null;
+		this.#wakeCommandStarted = false;
+		this.#wakePhraseInSegment = false;
+	}
+
+	#cancelWakeStream(): void {
 		const stream = this.#stream;
 		this.#stream = null;
 		stream?.cancel();
+	}
+
+	#expireWakeWindow(): void {
+		this.#resetWakeWindow();
+		this.#cancelWakeStream();
+		if (!this.#disposed && this.#state === "recording" && this.#acceptWakeInput()) {
+			this.#showWakeStatus(this.#wakeListeningStatus());
+		}
+	}
+
+	#scheduleWakeExpiry(): void {
+		clearTimeout(this.#wakeTimer);
+		this.#wakeTimer = undefined;
+		if (this.#wakeDeadline === null) return;
+		const remaining = this.#wakeDeadline - Date.now();
+		if (remaining <= 0) {
+			this.#expireWakeWindow();
+			return;
+		}
+		this.#wakeTimer = setTimeout(() => this.#expireWakeWindow(), remaining);
+	}
+
+	#observeWakePartial(text: string): void {
+		if (this.#wakeDeadline !== null && !this.#wakeCommandStarted && Date.now() >= this.#wakeDeadline) {
+			this.#expireWakeWindow();
+			return;
+		}
+		const stripped = this.#stripWakePhrase(text);
+		if (this.#wakeDeadline === null) {
+			if (stripped === null) return;
+			this.#wakeDeadline = Date.now() + this.#wakeTimeoutMs;
+			this.#wakePhraseInSegment = true;
+			this.#scheduleWakeExpiry();
+		}
+		const command = stripped ?? (this.#wakePhraseInSegment ? "" : text.trim());
+		if (command) {
+			this.#wakeCommandStarted = true;
+			clearTimeout(this.#wakeTimer);
+			this.#wakeTimer = undefined;
+		}
+		this.#showWakeStatus(this.#wakeCurrentStatus());
+	}
+
+	#takeWakeCommand(text: string): string | null {
+		if (this.#wakeDeadline !== null && !this.#wakeCommandStarted && Date.now() >= this.#wakeDeadline) {
+			this.#expireWakeWindow();
+			return null;
+		}
+		const stripped = this.#stripWakePhrase(text);
+		if (this.#wakeDeadline === null) {
+			if (stripped === null) return null;
+			this.#wakeDeadline = Date.now() + this.#wakeTimeoutMs;
+			this.#wakePhraseInSegment = true;
+		}
+		const command = stripped ?? (this.#wakePhraseInSegment ? null : text.trim());
+		if (command) {
+			this.#resetWakeWindow();
+			return command;
+		}
+		if (stripped === "") {
+			// A phrase-only endpoint opens the next segment, without restarting the
+			// window already announced by its first matching partial.
+			this.#wakePhraseInSegment = false;
+			this.#wakeCommandStarted = false;
+			this.#scheduleWakeExpiry();
+		} else {
+			this.#resetWakeWindow();
+		}
+		return null;
+	}
+
+	#acceptWakeInput(): boolean {
+		if (!this.#processingTranscript && this.#streamCallbacks?.acceptInput?.() !== false) return true;
+		// Drop the native utterance as well as any in-flight text, so resuming cannot
+		// complete assistant echo or a command spoken while the host was busy.
+		this.#resetWakeWindow();
+		this.#cancelWakeStream();
 		this.#showWakeStatus("Microphone on · wake listening paused while input is unavailable");
 		return false;
 	}
@@ -454,14 +667,10 @@ export class STTController {
 				if (this.#disposed || this.#stream !== stream || this.#state !== "recording") return;
 				if (this.#wakeWords.length > 0) {
 					if (!this.#acceptWakeInput()) return;
-					this.#showWakeStatus(
-						this.#stripWakePhrase(text) === null
-							? this.#wakeListeningStatus()
-							: "Microphone on · wake phrase detected; listening for command",
-					);
+					this.#observeWakePartial(text);
 					return;
 				}
-				this.#streamEditor?.setVolatileText(this.#prefixed(text));
+				this.#previewTranscript(text);
 			},
 			onSegment: text => {
 				if (this.#disposed || this.#stream !== stream) return;
@@ -469,26 +678,13 @@ export class STTController {
 					if (this.#state !== "recording" || !this.#acceptWakeInput()) return;
 					// A fresh command must not inherit the previous utterance's native
 					// decoder/cache context, including discarded ambient speech.
-					this.#stream = null;
-					stream.cancel();
-					const command = this.#stripWakePhrase(text);
-					// Never write partials, ambient speech, or the phrase alone into a
-					// typed draft. Every endpoint must address a fresh command.
-					if (command) {
-						this.#streamEditor?.commitVolatileText(command);
-						this.#streamEditor?.submit();
-					}
-					if (this.#acceptWakeInput()) this.#showWakeStatus(this.#wakeListeningStatus());
+					this.#cancelWakeStream();
+					const command = this.#takeWakeCommand(text);
+					if (command) void this.#deliverWakeCommand(command);
+					else if (this.#acceptWakeInput()) this.#showWakeStatus(this.#wakeCurrentStatus());
 					return;
 				}
-				const prefixed = this.#prefixed(text);
-				if (prefixed) {
-					this.#streamEditor?.commitVolatileText(prefixed);
-					this.#streamCommitted = true;
-					this.#streamUtterance += prefixed;
-				} else {
-					this.#streamEditor?.clearVolatileText();
-				}
+				this.#commitTranscriptSegment(text);
 			},
 		});
 		return stream;
@@ -507,8 +703,14 @@ export class STTController {
 		this.#streamUtterance = "";
 		const abort = new AbortController();
 		this.#streamAbort = abort;
+		this.#resetWakeWindow();
+		this.#wakeTimeoutMs = cfgSttWakeTimeoutMs.get(this.#settings);
 		this.#wakePhrase = wakePhrase;
-		this.#wakeWords = wakePhrase.normalize("NFKC").toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+		this.#wakeWords =
+			wakePhrase
+				.normalize("NFKC")
+				.toLowerCase()
+				.match(/[\p{L}\p{N}]+/gu) ?? [];
 		this.#stream = this.#openStream(modelKey, language);
 		let recorder: CaptureHandle;
 		try {
@@ -527,7 +729,12 @@ export class STTController {
 					}
 					this.#streamAbort?.abort(error);
 					this.#stream?.cancel();
-					if (this.#wakeWords.length === 0) this.#streamEditor?.clearVolatileText();
+					if (this.#wakeWords.length === 0) {
+						if (this.#reviewEnabled) {
+							const text = [this.#reviewSegments, this.#reviewPartial].filter(Boolean).join(" ");
+							if (text) this.#streamEditor?.commitVolatileText(text);
+						} else this.#streamEditor?.clearVolatileText();
+					}
 					this.#cleanupStream();
 					this.#setState("idle", options);
 					options.showWarning(error.message);
@@ -537,7 +744,7 @@ export class STTController {
 					if (!this.#acceptWakeInput()) return;
 					if (!this.#stream) {
 						this.#stream = this.#openStream(modelKey, language);
-						this.#showWakeStatus(this.#wakeListeningStatus());
+						this.#showWakeStatus(this.#wakeCurrentStatus());
 					}
 				}
 				this.#stream?.pushAudio(samples);
@@ -569,6 +776,7 @@ export class STTController {
 				logger.debug("stt: wake recorder stop failed", { error: String(err) });
 			}
 			this.#streamAbort?.abort();
+			this.#reviewAbort?.abort();
 			stream?.cancel();
 			this.#cleanupStream();
 			this.#setState("idle", options);
@@ -606,9 +814,9 @@ export class STTController {
 			this.#cleanupStream();
 			return;
 		}
-		this.#finishTranscript(finalText, failed, options);
+		await this.#finishTranscript(finalText, failed, options);
 		this.#cleanupStream();
-		this.#setState("idle", options);
+		if (!this.#disposed) this.#setState("idle", options);
 	}
 
 	#cleanupStream(): void {
@@ -622,9 +830,18 @@ export class STTController {
 		this.#wakePhrase = "";
 		this.#wakeWords = [];
 		this.#wakeStatus = "";
+		this.#resetWakeWindow();
 	}
 
-	#finishTranscript(finalText: string, failed: boolean, options: SttCallbacks): void {
+	async #finishTranscript(finalText: string, failed: boolean, options: SttCallbacks): Promise<void> {
+		if (this.#reviewEnabled) {
+			const text = finalText || [this.#reviewSegments, this.#reviewPartial].filter(Boolean).join(" ");
+			this.#reviewSegments = "";
+			this.#reviewPartial = "";
+			if (text && this.#streamEditor) await this.#reviewDraft(text, this.#streamEditor, options, failed);
+			else if (!failed) options.showStatus("No speech detected.");
+			return;
+		}
 		if (!this.#streamCommitted && finalText) {
 			const prefixed = this.#prefixed(finalText);
 			this.#streamEditor?.commitVolatileText(prefixed);
@@ -648,7 +865,13 @@ export class STTController {
 	}
 
 	dispose(): void {
+		if (this.#disposed) return;
+		if (this.#reviewEnabled && !this.#processingTranscript && this.#wakeWords.length === 0) {
+			const text = [this.#reviewSegments, this.#reviewPartial].filter(Boolean).join(" ");
+			if (text) this.#streamEditor?.commitVolatileText(text);
+		}
 		this.#disposed = true;
+		this.#reviewAbort?.abort();
 		this.#startAbort?.abort();
 		if (this.#streamAbort) {
 			this.#streamAbort.abort();
