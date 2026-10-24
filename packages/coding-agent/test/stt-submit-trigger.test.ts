@@ -7,7 +7,7 @@ import { STTController, type STTControllerDependencies } from "../src/stt/stt-co
 import { evaluateSubmitTrigger, type SttSubmitTrigger } from "../src/stt/submit-trigger";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
-import { cfgSttSubmitTrigger, cfgSttWakePhrase } from "@oh-my-pi/pi-coding-agent/stt/settings";
+import { cfgSttSubmitTrigger, cfgSttWakePhrase, cfgSttWakeTimeoutMs } from "@oh-my-pi/pi-coding-agent/stt/settings";
 
 const DICTATION_MODELS = [getBundledModel("local", "whisper-base")];
 const WAKE_MODELS = [
@@ -319,6 +319,8 @@ describe("STTController explicitly armed wake-phrase listening", () => {
 		settings.setModelRole("dictation", "local/nemotron-streaming-en-0.6b");
 		cfgSttWakePhrase.set(settings, "hey coach");
 		cfgSttSubmitTrigger.set(settings, "never");
+		cfgSttWakeTimeoutMs.set(settings, 15_000);
+		vi.useFakeTimers();
 		streams.length = 0;
 		captureStarts = 0;
 		stopCapture.mockClear();
@@ -334,6 +336,7 @@ describe("STTController explicitly armed wake-phrase listening", () => {
 	afterEach(() => {
 		controller?.dispose();
 		controller = undefined;
+		vi.useRealTimers();
 		vi.restoreAllMocks();
 		restoreSettingsTestState(state);
 	});
@@ -345,22 +348,20 @@ describe("STTController explicitly armed wake-phrase listening", () => {
 		expect(stopCapture).not.toHaveBeenCalled();
 	});
 
-	it.each([
-		"background conversation",
-		"please hey coach review this",
-		"hey coaches review this",
-		"hey",
-	])("rejects ambient or non-prefix speech without touching the editor: %s", async transcript => {
-		const target = editor();
-		await createController().start(target, callbacks());
-		const { options } = streams[0]!;
-		options.onPartial?.(transcript);
-		options.onSegment?.(transcript, 0);
-		expect(target.setVolatileText).not.toHaveBeenCalled();
-		expect(target.clearVolatileText).not.toHaveBeenCalled();
-		expect(target.commitVolatileText).not.toHaveBeenCalled();
-		expect(target.submit).not.toHaveBeenCalled();
-	});
+	it.each(["background conversation", "please hey coach review this", "hey coaches review this", "hey"])(
+		"rejects ambient or non-prefix speech without touching the editor: %s",
+		async transcript => {
+			const target = editor();
+			await createController().start(target, callbacks());
+			const { options } = streams[0]!;
+			options.onPartial?.(transcript);
+			options.onSegment?.(transcript, 0);
+			expect(target.setVolatileText).not.toHaveBeenCalled();
+			expect(target.clearVolatileText).not.toHaveBeenCalled();
+			expect(target.commitVolatileText).not.toHaveBeenCalled();
+			expect(target.submit).not.toHaveBeenCalled();
+		},
+	);
 
 	it("strips case and punctuation-normalized prefix words and submits only at the endpoint", async () => {
 		const target = editor();
@@ -377,13 +378,18 @@ describe("STTController explicitly armed wake-phrase listening", () => {
 		expect(controller?.state).toBe("recording");
 	});
 
-	it("requires a fresh prefix for each command and does not arm on the phrase alone", async () => {
+	it("accepts a delayed next-segment command after the phrase alone, then requires a fresh prefix", async () => {
 		const target = editor();
-		await createController().start(target, callbacks());
+		const options = callbacks();
+		await createController().start(target, options);
 		const stream = streams[0]!;
 		endpoint("hey coach");
-		endpoint("do not submit this ambient utterance");
-		endpoint("hey coach first command");
+		expect(options.showStatus).toHaveBeenLastCalledWith(
+			"Microphone on · wake phrase detected; listening for command",
+		);
+		expect(target.commitVolatileText).not.toHaveBeenCalled();
+		vi.advanceTimersByTime(14_000);
+		endpoint("first command");
 		endpoint("another ambient utterance");
 		endpoint("hey coach second command");
 		expect(target.commitVolatileText.mock.calls).toEqual([["first command"], ["second command"]]);
@@ -395,24 +401,105 @@ describe("STTController explicitly armed wake-phrase listening", () => {
 		expect(stopCapture).toHaveBeenCalledTimes(1);
 	});
 
-	it("toggle-off discards pending addressed speech and suppresses late worker callbacks", async () => {
+	it("expires at the configured deadline from first detection, not repeated partials or the phrase endpoint", async () => {
+		cfgSttWakeTimeoutMs.set(settings, 5_000);
 		const target = editor();
 		const options = callbacks();
-		await createController().toggle(target, options);
-		const stream = streams[0]!;
-		stream.options.onPartial?.("hey coach unfinished command");
-		await controller?.toggle(target, options);
-		stream.options.onSegment?.("hey coach unfinished command", 0);
+		await createController().start(target, options);
+		const phrase = streams[0]!;
+		phrase.options.onPartial?.("hey coach");
+		vi.advanceTimersByTime(4_000);
+		phrase.options.onPartial?.("hey coach");
+		phrase.options.onSegment?.("hey coach", 0);
+		onAudio(null, Float32Array.of(0));
+		const waiting = streams.at(-1)!;
+		vi.advanceTimersByTime(999);
+		expect(waiting.handle.cancel).not.toHaveBeenCalled();
+		vi.advanceTimersByTime(1);
+		expect(waiting.handle.cancel).toHaveBeenCalledTimes(1);
+		expect(options.showStatus).toHaveBeenLastCalledWith("Microphone on · listening for “hey coach …”");
+		waiting.options.onPartial?.("late command");
+		waiting.options.onSegment?.("hey coach stale command", 0);
+		endpoint("late command without a new prefix");
 		expect(target.commitVolatileText).not.toHaveBeenCalled();
-		expect(target.submit).not.toHaveBeenCalled();
-		expect(controller?.state).toBe("idle");
-		expect(stopCapture).toHaveBeenCalledTimes(1);
+		endpoint("hey coach fresh command");
+		expect(target.commitVolatileText.mock.calls).toEqual([["fresh command"]]);
+		expect(target.submit).toHaveBeenCalledTimes(1);
 	});
+
+	it.each([true, false])(
+		"allows speech recognized before expiry to finalize much later (separate phrase: %s)",
+		async separatePhrase => {
+			const target = editor();
+			await createController().start(target, callbacks());
+			if (separatePhrase) endpoint("hey coach");
+			else streams[0]!.options.onPartial?.("hey coach");
+			vi.advanceTimersByTime(14_999);
+			onAudio(null, Float32Array.of(0));
+			const command = streams.at(-1)!;
+			const prefix = separatePhrase ? "" : "hey coach ";
+			command.options.onPartial?.(`${prefix}explain the`);
+			vi.advanceTimersByTime(60_000);
+			expect(command.handle.cancel).not.toHaveBeenCalled();
+			command.options.onPartial?.(`${prefix}explain the entire long command`);
+			command.options.onSegment?.(`${prefix}explain the entire long command`, 0);
+			endpoint("unaddressed tail after the command");
+			expect(target.commitVolatileText.mock.calls).toEqual([["explain the entire long command"]]);
+			expect(target.submit).toHaveBeenCalledTimes(1);
+		},
+	);
+
+	it.each(["agent activity", "assistant playback", "typed draft"])(
+		"clears a phrase-only window when host availability rejects %s",
+		async () => {
+			let available = true;
+			const target = editor();
+			await createController().start(
+				target,
+				callbacks(() => available),
+			);
+			endpoint("hey coach");
+			available = false;
+			onAudio(null, Float32Array.of(0));
+			available = true;
+			endpoint("interrupted command without a prefix");
+			endpoint("hey coach fresh command");
+			expect(target.commitVolatileText.mock.calls).toEqual([["fresh command"]]);
+			expect(target.submit).toHaveBeenCalledTimes(1);
+		},
+	);
+
+	it.each([true, false])(
+		"toggle-off cancels the window and suppresses late callbacks (phrase only: %s)",
+		async phraseOnly => {
+			const target = editor();
+			const options = callbacks();
+			await createController().toggle(target, options);
+			const stream = streams[0]!;
+			if (phraseOnly) endpoint("hey coach");
+			else stream.options.onPartial?.("hey coach unfinished command");
+			await controller?.toggle(target, options);
+			const statusCount = options.showStatus.mock.calls.length;
+			vi.advanceTimersByTime(60_000);
+			stream.options.onSegment?.("hey coach unfinished command", 0);
+			expect(target.commitVolatileText).not.toHaveBeenCalled();
+			expect(target.submit).not.toHaveBeenCalled();
+			expect(options.showStatus).toHaveBeenCalledTimes(statusCount);
+			expect(controller?.state).toBe("idle");
+			expect(stopCapture).toHaveBeenCalledTimes(1);
+			await controller?.start(target, options);
+			endpoint("old command after rearming without a prefix");
+			expect(target.commitVolatileText).not.toHaveBeenCalled();
+		},
+	);
 
 	it("discards busy or echoed utterances, resumes a fresh stream, and ignores stale endpoints", async () => {
 		let available = true;
 		const target = editor();
-		await createController().start(target, callbacks(() => available));
+		await createController().start(
+			target,
+			callbacks(() => available),
+		);
 		const beforePause = streams[0]!;
 		beforePause.options.onPartial?.("hey coach interrupted");
 		available = false;
@@ -432,7 +519,10 @@ describe("STTController explicitly armed wake-phrase listening", () => {
 	it("rechecks availability at the endpoint even if no microphone chunk observed the busy transition", async () => {
 		let available = true;
 		const target = editor();
-		await createController().start(target, callbacks(() => available));
+		await createController().start(
+			target,
+			callbacks(() => available),
+		);
 		const stream = streams[0]!;
 		stream.options.onPartial?.("hey coach queued command");
 		available = false;
@@ -444,19 +534,26 @@ describe("STTController explicitly armed wake-phrase listening", () => {
 		expect(stopCapture).toHaveBeenCalledTimes(1);
 	});
 
-	it("dispose cancels addressed speech without submitting or accepting later microphone input", async () => {
-		const target = editor();
-		await createController().start(target, callbacks());
-		const stream = streams[0]!;
-		stream.options.onPartial?.("hey coach pending");
-		controller?.dispose();
-		stream.options.onSegment?.("hey coach pending", 0);
-		onAudio(null, Float32Array.of(1));
-		expect(target.commitVolatileText).not.toHaveBeenCalled();
-		expect(target.submit).not.toHaveBeenCalled();
-		expect(stream.handle.pushAudio).not.toHaveBeenCalled();
-		expect(stopCapture).toHaveBeenCalledTimes(1);
-	});
+	it.each([true, false])(
+		"dispose cancels the window without accepting later input (phrase only: %s)",
+		async phraseOnly => {
+			const target = editor();
+			const options = callbacks();
+			await createController().start(target, options);
+			const stream = streams[0]!;
+			if (phraseOnly) endpoint("hey coach");
+			else stream.options.onPartial?.("hey coach pending");
+			controller?.dispose();
+			const statusCount = options.showStatus.mock.calls.length;
+			vi.advanceTimersByTime(60_000);
+			stream.options.onSegment?.("hey coach pending", 0);
+			onAudio(null, Float32Array.of(1));
+			expect(target.commitVolatileText).not.toHaveBeenCalled();
+			expect(target.submit).not.toHaveBeenCalled();
+			expect(options.showStatus).toHaveBeenCalledTimes(statusCount);
+			expect(stopCapture).toHaveBeenCalledTimes(1);
+		},
+	);
 
 	it.each(["local/whisper-base", "openai/whisper-1"])(
 		"rejects non-online or cloud dictation before opening the microphone: %s",
