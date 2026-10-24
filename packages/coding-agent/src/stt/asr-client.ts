@@ -38,6 +38,8 @@ export interface SttStreamHandle {
 export interface SttStreamOptions {
 	language?: string;
 	signal?: AbortSignal;
+	/** Emit endpoints without retaining a joined transcript (continuous private listening). */
+	discardTranscript?: boolean;
 	/** Volatile transcript of the in-progress segment, refreshed as audio arrives. */
 	onPartial?: (text: string) => void;
 	/** A finalized segment, emitted once when the endpointer commits it. */
@@ -132,7 +134,13 @@ export class SttClient {
 			reject,
 			finish,
 		});
-		worker.send({ type: "stream_start", id, modelKey, language: options.language });
+		worker.send({
+			type: "stream_start",
+			id,
+			modelKey,
+			language: options.language,
+			discardTranscript: options.discardTranscript,
+		});
 		const handle: SttStreamHandle = {
 			pushAudio: audio => {
 				if (!settled) worker.send({ type: "stream_audio", id, audio });

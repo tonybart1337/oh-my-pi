@@ -31,12 +31,79 @@ function restoreEnvValue(key: string, value: string | undefined): void {
 	}
 }
 describe("KeybindingsManager.create", () => {
+	let originalOverlayPath: string | undefined;
 	beforeEach(() => {
+		originalOverlayPath = process.env.PI_KEYBINDINGS_FILE;
+		delete process.env.PI_KEYBINDINGS_FILE;
 		setKeybindings(KeybindingsManager.inMemory());
 	});
 
 	afterEach(() => {
+		restoreEnvValue("PI_KEYBINDINGS_FILE", originalOverlayPath);
 		setKeybindings(KeybindingsManager.inMemory());
+	});
+
+	it("applies a read-only overlay after inherited and profile bindings and retains its path on reload", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-keybindings-overlay-"));
+		const inheritedDir = path.join(root, "default");
+		const profileDir = path.join(root, "profile");
+		const overlayPath = path.join(root, "overlay.json");
+		try {
+			await writeKeybindingsYaml(inheritedDir, {
+				"app.session.fork": "ctrl+f",
+				"app.session.new": "ctrl+n",
+			});
+			await writeKeybindingsYaml(profileDir, {
+				"app.session.fork": "alt+f",
+				"app.session.new": "alt+n",
+			});
+			// Legacy names migrate in memory without rewriting the explicit overlay.
+			await Bun.write(overlayPath, '{ "fork": "ctrl+shift+f", "app.stt.toggle": "Ctrl+Space" }\n');
+			const paths = [path.join(inheritedDir, "keybindings.yml"), path.join(profileDir, "keybindings.yml"), overlayPath];
+			const before = await Promise.all(paths.map(filePath => Bun.file(filePath).text()));
+			process.env.PI_KEYBINDINGS_FILE = overlayPath;
+			const manager = KeybindingsManager.create(profileDir, { inheritedAgentDir: inheritedDir });
+			expect(manager.getKeys("app.session.fork")).toEqual(["ctrl+shift+f"]);
+			expect(manager.getKeys("app.session.new")).toEqual(["alt+n"]);
+			expect(manager.getKeys("app.stt.toggle")).toEqual(["ctrl+space"]);
+			delete process.env.PI_KEYBINDINGS_FILE;
+			manager.reload();
+			expect(manager.getKeys("app.session.fork")).toEqual(["ctrl+shift+f"]);
+			expect(await Promise.all(paths.map(filePath => Bun.file(filePath).text()))).toEqual(before);
+			expect(await Bun.file(path.join(root, "overlay.yml")).exists()).toBe(false);
+			await Bun.write(overlayPath, '{ "fork": "alt+shift+f" }');
+			manager.reload();
+			expect(manager.getKeys("app.session.fork")).toEqual(["alt+shift+f"]);
+			await fs.rm(overlayPath);
+			expect(() => manager.reload()).toThrow("PI_KEYBINDINGS_FILE");
+		} finally {
+			await removeWithRetries(root);
+		}
+	});
+
+	it("rejects a missing explicit overlay without silently loading profile defaults", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-keybindings-overlay-"));
+		try {
+			process.env.PI_KEYBINDINGS_FILE = path.join(root, "missing.yml");
+			expect(() => KeybindingsManager.create(root)).toThrow(`PI_KEYBINDINGS_FILE (${process.env.PI_KEYBINDINGS_FILE})`);
+		} finally {
+			await removeWithRetries(root);
+		}
+	});
+
+	it("rejects syntax errors and invalid binding shapes in an explicit overlay", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-keybindings-overlay-"));
+		try {
+			const overlayPath = path.join(root, "overlay.yml");
+			process.env.PI_KEYBINDINGS_FILE = overlayPath;
+			for (const content of ["app.stt.toggle: [", "- ctrl+space", "app.stt.toggle: 42", "null"]) {
+				await Bun.write(overlayPath, content);
+				expect(() => KeybindingsManager.create(root)).toThrow(`PI_KEYBINDINGS_FILE (${overlayPath})`);
+				expect(await Bun.file(overlayPath).text()).toBe(content);
+			}
+		} finally {
+			await removeWithRetries(root);
+		}
 	});
 
 	it("migrates legacy keybinding JSON to YAML during create", async () => {

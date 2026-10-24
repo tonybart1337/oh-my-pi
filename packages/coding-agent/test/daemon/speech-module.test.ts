@@ -132,6 +132,20 @@ describe("daemon speech module", () => {
 	);
 
 	it(
+		"hands the worker a stream_start's discardTranscript (private continuous listening keeps no transcript)",
+		async () => {
+			const client = await startDaemon();
+			const tunnel = await attach(client, await openSpeech(client, "stt:auto:auto"));
+			tunnel.send({ type: "stream_start", id: "wake", tag: "W", modelKey: "m", discardTranscript: true });
+			await tunnel.frame("stream_started", "wake");
+
+			const start = (await workerLog()).find(header => header.type === "stream_start");
+			expect(start).toMatchObject({ modelKey: "m", discardTranscript: true });
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
 		"delivers a stream's audio chunks only to the originating tunnel, in order",
 		async () => {
 			const client = await startDaemon();
