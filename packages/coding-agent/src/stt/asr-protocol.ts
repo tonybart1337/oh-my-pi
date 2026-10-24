@@ -29,7 +29,7 @@ export type SttWorkerInbound =
 	// 16 kHz mono float frames as they arrive from the recorder; `stream_stop`
 	// flushes the trailing speech segment and ends the session; `stream_cancel`
 	// tears it down without a final flush. All carry the same `id`.
-	| { type: "stream_start"; id: string; modelKey: SttModelKey; language?: string }
+	| { type: "stream_start"; id: string; modelKey: SttModelKey; language?: string; discardTranscript?: boolean }
 	| { type: "stream_audio"; id: string; audio: Float32Array }
 	| { type: "stream_stop"; id: string }
 	| { type: "stream_cancel"; id: string };
@@ -45,7 +45,7 @@ export type SttWorkerOutbound =
 	// `partial` is the volatile transcript of the in-progress speech segment
 	// (refreshed as more audio arrives, never appended verbatim); `segment` is a
 	// finalized segment committed once at an endpoint; `stream_done` carries the
-	// full transcript (all committed segments joined) when the session ends.
+	// full joined transcript, or an empty string when `discardTranscript` is set.
 	| { type: "partial"; id: string; text: string }
 	| { type: "segment"; id: string; index: number; text: string }
 	| { type: "stream_done"; id: string; text: string };
