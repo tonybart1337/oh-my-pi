@@ -9671,6 +9671,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			registry: this.session.modelRegistry,
 			getSessionId: () => this.session.sessionId,
 			getSessionProvider: () => this.session.model?.provider,
+			getSessionModel: () => this.session.model,
 		});
 		return this.#sttController;
 	}
