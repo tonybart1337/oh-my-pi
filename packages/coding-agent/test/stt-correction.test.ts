@@ -3,7 +3,7 @@ import * as ai from "@oh-my-pi/pi-ai";
 import * as transcription from "@oh-my-pi/pi-ai/transcription";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { logger } from "@oh-my-pi/pi-utils";
-import { cfgOffline } from "../src/config/auxiliary-model-policy";
+import { cfgNoJudge, cfgOffline } from "../src/config/auxiliary-model-policy";
 import { Settings, settings } from "../src/config/settings";
 import { ChainJudge } from "../src/judgment";
 import { cfgRetryFallbackChains } from "../src/session/settings";
@@ -11,15 +11,18 @@ import * as asr from "../src/stt/asr-client";
 import * as correction from "../src/stt/correction";
 import * as downloader from "../src/stt/downloader";
 import {
+	cfgSttConfirmEnabled,
 	cfgSttCorrectionEnabled,
 	cfgSttCorrectionGate,
 	cfgSttCorrectionGateEnabled,
 	cfgSttCorrectionModelEnabled,
+	cfgSttConfirmJudge,
 	cfgSttCorrectionModel,
 	cfgSttSubmitTrigger,
 	cfgSttWakePhrase,
 } from "../src/stt/settings";
 import { STTController } from "../src/stt/stt-controller";
+import { classifyVoiceReply } from "../src/stt/voice-reply";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
 const usage = {
@@ -43,16 +46,24 @@ const registry = {
 	resolver: () => () => "test-key",
 	resolveModelHeaders: async () => undefined,
 };
+/** Mirrors the TUI editor: the volatile preview is part of the text until committed or cleared. */
 function editor() {
 	let text = "";
+	let volatile = "";
 	return {
-		text: () => text,
+		text: () => text + volatile,
 		setText: vi.fn((value: string) => {
 			text = value;
+			volatile = "";
 		}),
-		setVolatileText: vi.fn(),
-		clearVolatileText: vi.fn(),
+		setVolatileText: vi.fn((value: string) => {
+			volatile = value;
+		}),
+		clearVolatileText: vi.fn(() => {
+			volatile = "";
+		}),
 		commitVolatileText: vi.fn((value: string) => {
+			volatile = "";
 			text += value;
 		}),
 		submit: vi.fn(),
@@ -84,6 +95,7 @@ beforeEach(async () => {
 	});
 });
 afterEach(() => {
+	vi.useRealTimers();
 	controller?.dispose();
 	controller = undefined;
 	vi.restoreAllMocks();
@@ -99,6 +111,11 @@ function create() {
 	);
 	return controller;
 }
+/** Advances fake timers, then lets the promise chains they started settle. */
+async function elapse(ms: number) {
+	vi.advanceTimersByTime(ms);
+	for (let i = 0; i < 20; i++) await Promise.resolve();
+}
 
 describe("dictation correction draft delivery", () => {
 	it.each([false, true])("never submits or strips submit words, including manualSubmit=%s", async manualSubmit => {
@@ -106,10 +123,11 @@ describe("dictation correction draft delivery", () => {
 		const target = editor();
 		const callbacks = options();
 		await create().start(target, { ...callbacks, manualSubmit });
+		// Recognized text stays visible while speaking, before review replaces it.
 		streamOptions.onPartial?.("hello");
+		expect(target.text()).toBe("hello");
 		streamOptions.onSegment?.("hello world", 0);
-		expect(target.text()).toBe("");
-		expect(target.setVolatileText).not.toHaveBeenCalled();
+		expect(target.text()).toBe("hello world");
 		await controller!.stop();
 		expect(target.text()).toBe("Hello world submit.");
 		expect(target.submit).not.toHaveBeenCalled();
@@ -222,22 +240,81 @@ describe("dictation correction draft delivery", () => {
 		expect(target.text()).toBe("Hello world submit.");
 		expect(target.submit).not.toHaveBeenCalled();
 	});
-	it("delivers wake commands as drafts and pauses further wake input", async () => {
+	it("delivers continuous wake commands as drafts and pauses further wake input", async () => {
+		vi.useFakeTimers();
 		cfgSttWakePhrase.set(settings, "hey coach");
 		const pending = Promise.withResolvers<correction.CorrectionResult>();
 		const correct = vi.spyOn(correction, "correctTranscript").mockReturnValue(pending.promise);
 		const target = editor();
-		const callbacks = { ...options(), acceptInput: () => !target.text() };
+		const callbacks = {
+			...options(),
+			continuous: true,
+			acceptInput: (expected: string) => target.text() === expected,
+		};
 		await create().start(target, callbacks);
-		streamOptions.onSegment?.("hey coach hello world", 0);
+		// Lead-in words before the phrase in the same breath do not hide it.
+		streamOptions.onSegment?.("okay hey coach hello world", 0);
+		expect(target.text()).toBe("hello world");
+		expect(correct).not.toHaveBeenCalled();
+		await elapse(700);
 		expect(target.text()).toBe("hello world");
 		expect(target.submit).not.toHaveBeenCalled();
 		streamOptions.onSegment?.("hey coach second command", 1);
+		await elapse(700);
 		expect(correct).toHaveBeenCalledTimes(1);
 		pending.resolve({ text: "Hello world." });
-		await Promise.resolve();
-		await Promise.resolve();
+		await elapse(0);
 		expect(target.text()).toBe("Hello world.");
+		expect(callbacks.showStatus).toHaveBeenCalledWith(
+			"Corrected: punctuation · Dictation draft · review and press Send.",
+		);
+	});
+	it.each([
+		["Yep.", "book a table for two", 1],
+		["start over", "", 0],
+		[
+			"and ask for a window seat if they have one please",
+			"book a table for two and ask for a window seat if they have one please",
+			0,
+		],
+	] as const)("open-mic voice draft answers %p", async (reply, text, submits) => {
+		vi.useFakeTimers();
+		cfgSttCorrectionEnabled.set(settings, false);
+		cfgSttConfirmEnabled.set(settings, true);
+		const target = editor();
+		const callbacks = {
+			...options(),
+			continuous: true,
+			acceptInput: (expected: string) => target.text() === expected,
+		};
+		await create().start(target, callbacks);
+		streamOptions.onSegment?.("book a table for two", 0);
+		await elapse(700);
+		expect(target.text()).toBe("book a table for two");
+		expect(callbacks.showStatus).toHaveBeenCalledWith("Draft ready · say “send” to submit or “reset” to clear");
+		streamOptions.onSegment?.(reply, 1);
+		await elapse(700);
+		expect(target.text()).toBe(text);
+		expect(target.submit).toHaveBeenCalledTimes(submits);
+	});
+	it("never sends a voice draft the user edited before replying", async () => {
+		vi.useFakeTimers();
+		cfgSttCorrectionEnabled.set(settings, false);
+		cfgSttConfirmEnabled.set(settings, true);
+		const target = editor();
+		const callbacks = {
+			...options(),
+			continuous: true,
+			acceptInput: (expected: string) => target.text() === expected,
+		};
+		await create().start(target, callbacks);
+		streamOptions.onSegment?.("book a table", 0);
+		await elapse(700);
+		target.setText("book a table, typed by hand");
+		streamOptions.onSegment?.("send", 1);
+		await elapse(700);
+		expect(target.submit).not.toHaveBeenCalled();
+		expect(target.text()).toBe("book a table, typed by hand");
 	});
 	it("both stages disabled makes no processing calls and still requires Send", async () => {
 		cfgSttCorrectionGateEnabled.set(settings, false);
@@ -413,5 +490,42 @@ describe("two-stage correction model execution", () => {
 		await expect(
 			correction.correctTranscript("text", { settings, registry, signal: abort.signal }),
 		).rejects.toThrow();
+	});
+});
+
+describe("spoken reply judge", () => {
+	it("asks the configured confirm judge before the judge role chain", async () => {
+		settings.setModelRole("judge", `${haiku.provider}/${haiku.id}`);
+		cfgSttConfirmJudge.set(settings, `${fallback.provider}/${fallback.id}`);
+		const judge = vi.spyOn(ChainJudge.prototype, "judge").mockResolvedValue({
+			api: "typesafe",
+			provider: "typesafe",
+			model: "jev",
+			usage,
+			answers: {
+				send_draft: { type: "noul", noul: 0.9 },
+				reset_draft: { type: "noul", noul: 0.1 },
+			},
+		});
+		await classifyVoiceReply("sounds good to me", "book a table", { settings, registry });
+		expect(judge.mock.contexts.map(context => (context as ChainJudge).primaryModel()?.id)).toEqual([fallback.id]);
+	});
+	it("confines the confirm judge to the session provider under models.noJudge", async () => {
+		cfgNoJudge.set(settings, true);
+		settings.setModelRole("judge", `${fallback.provider}/${fallback.id}`);
+		cfgSttConfirmJudge.set(settings, `${fallback.provider}/${fallback.id}`);
+		const judge = vi.spyOn(ChainJudge.prototype, "judge").mockResolvedValue({
+			api: "typesafe",
+			provider: "typesafe",
+			model: "jev",
+			usage,
+			answers: { send_draft: { type: "noul", noul: 0.9 }, reset_draft: { type: "noul", noul: 0.1 } },
+		});
+		await classifyVoiceReply("sounds good to me", "book a table", { settings, registry, sessionModel: haiku });
+		await classifyVoiceReply("sounds good to me", "book a table", { settings, registry });
+		expect(judge.mock.contexts.map(context => (context as ChainJudge).primaryModel()?.id)).toEqual([
+			haiku.id,
+			undefined,
+		]);
 	});
 });

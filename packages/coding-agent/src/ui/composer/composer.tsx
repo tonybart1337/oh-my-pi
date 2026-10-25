@@ -503,6 +503,8 @@ export class Composer {
 		this.#recalledState = false;
 		this.#vimBrowse = null;
 		this.#vimEdits.clear();
+		// Replaced text no longer holds the dictation preview, so a later clear must not delete user text.
+		this.#volatile.set(undefined);
 		this.#change(0, this.#text().length, text, text.length, "edit");
 	}
 
