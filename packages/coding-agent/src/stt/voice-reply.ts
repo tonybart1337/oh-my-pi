@@ -6,8 +6,16 @@ import { cfgSttConfirmJudge } from "./settings";
 
 const QUESTIONS = judgeQuestions(questionFile);
 
-/** What a spoken reply to a ready voice draft asks for; `other` is more dictation or unrelated speech. */
-export type VoiceReply = "send" | "reset" | "other";
+/**
+ * What a spoken reply to a ready voice draft asks for. `continue` keeps dictating into the draft;
+ * with `text` ("continue, and book a taxi") those words are the continuation. `other` is more
+ * dictation or unrelated speech.
+ */
+export type VoiceReply =
+	| { action: "send" }
+	| { action: "reset" }
+	| { action: "continue"; text: string }
+	| { action: "other" };
 
 const SEND_WORDS: Record<string, true> = {
 	send: true,
@@ -40,6 +48,24 @@ const RESET_WORDS: Record<string, true> = {
 	nevermind: true,
 	"delete it": true,
 };
+const CONTINUE_WORDS: Record<string, true> = {
+	continue: true,
+	"continue dictating": true,
+	"keep going": true,
+	"go on": true,
+	"let me continue": true,
+	"i want to continue": true,
+	"not yet": true,
+	wait: true,
+	"hold on": true,
+	"i m not done": true,
+	"im not done": true,
+	"not done": true,
+	more: true,
+	"add more": true,
+};
+/** “continue, <more words>” in one breath: the words after it are the continuation. */
+const CONTINUE_PREFIX = /^[\s\p{P}]*(?:continue|keep going)\b[\s\p{P}]*/iu;
 
 export interface VoiceReplyDependencies {
 	settings: Settings;
@@ -47,10 +73,12 @@ export interface VoiceReplyDependencies {
 	sessionId?: string;
 	signal?: AbortSignal;
 	onUsage?: (usage: JudgmentUsage) => void;
+	/** Only exact keywords count; everything else is `other` without asking the judge. */
+	keywordsOnly?: boolean;
 }
 
 /**
- * Exact short confirmations resolve locally; other short replies ask the configured judge (Jev by
+ * Exact short replies resolve locally; other short replies ask the configured judge (Jev by
  * default). Without a judge the reply is `other`, and a judge failure rejects so the caller keeps
  * the draft; a draft is never sent on a guess. Both texts go to the judge as quoted state.
  */
@@ -65,11 +93,14 @@ export async function classifyVoiceReply(
 		.replace(/[^\p{L}\p{N}\s]+/gu, " ")
 		.replace(/\s+/g, " ")
 		.trim();
-	if (SEND_WORDS[normalized]) return "send";
-	if (RESET_WORDS[normalized]) return "reset";
+	if (SEND_WORDS[normalized]) return { action: "send" };
+	if (RESET_WORDS[normalized]) return { action: "reset" };
+	if (CONTINUE_WORDS[normalized]) return { action: "continue", text: "" };
+	const prefix = CONTINUE_PREFIX.exec(reply);
+	if (prefix) return { action: "continue", text: reply.slice(prefix[0].length).trim() };
 	const selector = cfgSttConfirmJudge.get(deps.settings).trim();
 	// Long replies are continued dictation; only short utterances are plausible confirmations.
-	if (!selector || !deps.registry || normalized.split(" ").length > 8) return "other";
+	if (deps.keywordsOnly || !selector || !deps.registry || normalized.split(" ").length > 8) return { action: "other" };
 	const timeout = AbortSignal.timeout(15_000);
 	const signal = deps.signal ? AbortSignal.any([deps.signal, timeout]) : timeout;
 	const judge = resolveJudge({
@@ -81,13 +112,15 @@ export async function classifyVoiceReply(
 		onUsage: deps.onUsage,
 	});
 	const { answers } = await judge.judge({ state: { draft, reply }, questions: QUESTIONS }, { signal });
-	const probability = (id: "send_draft" | "reset_draft"): number => {
+	const probability = (id: "send_draft" | "reset_draft" | "continue_draft"): number => {
 		const answer = answers[id];
 		return answer?.type === "noul" && Number.isFinite(answer.noul) ? answer.noul : 0;
 	};
 	const send = probability("send_draft");
 	const reset = probability("reset_draft");
-	if (send >= 0.5 && send > reset) return "send";
-	if (reset >= 0.5 && reset > send) return "reset";
-	return "other";
+	const more = probability("continue_draft");
+	if (send >= 0.5 && send > reset && send > more) return { action: "send" };
+	if (reset >= 0.5 && reset > send && reset > more) return { action: "reset" };
+	if (more >= 0.5 && more > send && more > reset) return { action: "continue", text: "" };
+	return { action: "other" };
 }

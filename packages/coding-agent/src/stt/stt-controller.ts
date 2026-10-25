@@ -77,6 +77,8 @@ function supportsReview(registry: SttRegistry | undefined): registry is SttRegis
 	return !!registry?.getApiKey && !!registry.resolveModelHeaders;
 }
 
+const READY_STATUS = "Draft ready · say “send”, “continue” or “reset”";
+
 /** Joins recognized phrases with single spaces, skipping empty ones. */
 function joinWords(...parts: string[]): string {
 	return parts
@@ -143,6 +145,10 @@ export class STTController {
 	/** A ready voice draft awaiting a spoken send/reset. Wake listening accepts unaddressed replies until `until`. */
 	#voiceDraft: { until: number | null } | null = null;
 	#voiceDraftTimer: Timer | undefined;
+	/** After a spoken “continue”, the next utterance is dictation appended to the draft (no wake
+	 *  phrase needed, only exact send/reset keywords still count) until this time. */
+	#continueUntil: number | null = null;
+	#continueTimer: Timer | undefined;
 
 	// Buffered cloud capture.
 	#cloudModel: Model<Api> | null = null;
@@ -608,15 +614,19 @@ export class STTController {
 		return this.#voiceDraft !== null && (this.#voiceDraft.until === null || Date.now() < this.#voiceDraft.until);
 	}
 
+	#continuing(): boolean {
+		return this.#continueUntil !== null && Date.now() < this.#continueUntil;
+	}
+
 	/** The part of recognized `text` meant for the editor, or null for speech to ignore. Open-mic
 	 *  speech is always addressed; wake listening needs the phrase, its open window, the utterance it
-	 *  already started, or (unaddressed) a reply while a voice draft awaits confirmation. */
+	 *  already started, a spoken “continue”, or (unaddressed) a reply while a voice draft awaits one. */
 	#heard(text: string): { command: string; addressed: boolean } | null {
 		if (this.#wakeWords.length === 0) return { command: text.trim(), addressed: true };
 		const command = this.#afterWakePhrase(text);
 		if (command !== null) return { command, addressed: true };
 		if (this.#utterance) return { command: text.trim(), addressed: this.#utteranceAddressed };
-		if (this.#wakeWindowOpen()) return { command: text.trim(), addressed: true };
+		if (this.#wakeWindowOpen() || this.#continuing()) return { command: text.trim(), addressed: true };
 		if (this.#replyWindowOpen()) return { command: text.trim(), addressed: false };
 		return null;
 	}
@@ -628,10 +638,11 @@ export class STTController {
 	}
 
 	#idleListenStatus(): string {
+		if (this.#continuing()) return "Continuing · keep dictating";
 		if (this.#voiceDraft) {
 			return this.#replyWindowOpen()
-				? "Draft ready · say “send” to submit or “reset” to clear"
-				: `Draft ready · say “${this.#wakePhrase}, send” or “${this.#wakePhrase}, reset”`;
+				? READY_STATUS
+				: `Draft ready · say “${this.#wakePhrase}, send”, “${this.#wakePhrase}, continue” or “${this.#wakePhrase}, reset”`;
 		}
 		return this.#wakeWords.length > 0
 			? `Microphone on · listening for “${this.#wakePhrase} …”`
@@ -703,6 +714,26 @@ export class STTController {
 		clearTimeout(this.#voiceDraftTimer);
 		this.#voiceDraftTimer = undefined;
 		this.#voiceDraft = null;
+		this.#stopContinuing();
+	}
+
+	/** “Continue”: keep the draft open for more dictation for `stt.wakeTimeoutMs` to start speaking. */
+	#startContinuing(): void {
+		clearTimeout(this.#continueTimer);
+		this.#continueUntil = Date.now() + this.#wakeTimeoutMs;
+		this.#continueTimer = setTimeout(() => {
+			this.#continueTimer = undefined;
+			this.#continueUntil = null;
+			if (!this.#utterance && this.#state === "recording") this.#showListenStatus(this.#idleListenStatus());
+		}, this.#wakeTimeoutMs);
+		this.#listenStatus = "";
+		this.#showListenStatus(this.#idleListenStatus());
+	}
+
+	#stopContinuing(): void {
+		clearTimeout(this.#continueTimer);
+		this.#continueTimer = undefined;
+		this.#continueUntil = null;
 	}
 
 	/** Whether recognition may reach the editor now. An editor emptied by Send or a manual clear
@@ -777,27 +808,36 @@ export class STTController {
 		const options = this.#streamCallbacks;
 		if (!text || !editor || !options || this.#disposed || !this.#acceptContinuousInput()) return;
 		if (this.#voiceDraft) {
-			const reply = await this.#classifyReply(text, options);
+			// While continuing, only exact send/reset words end the draft; everything else is dictation.
+			const reply = await this.#classifyReply(text, options, this.#continuing());
 			if (this.#disposed || this.#streamEditor !== editor) return;
 			if (reply === null) {
 				this.#showPreview("");
 				return;
 			}
-			if (reply !== "other") {
-				this.#applyReply(reply, editor, options);
+			if (reply.action === "send" || reply.action === "reset") {
+				this.#applyReply(reply.action, editor, options);
+				return;
+			}
+			if (reply.action === "continue") {
+				if (reply.text) await this.#deliverUtterance(reply.text, editor, options);
+				else {
+					this.#showPreview("");
+					this.#startContinuing();
+				}
 				return;
 			}
 			if (!addressed) {
 				this.#showPreview("");
 				this.#listenStatus = "";
-				this.#showListenStatus(`Not a send or reset · ${this.#idleListenStatus()}`);
+				this.#showListenStatus(`Not a send, continue or reset · ${this.#idleListenStatus()}`);
 				return;
 			}
 		}
 		await this.#deliverUtterance(text, editor, options);
 	}
 
-	async #classifyReply(text: string, options: SttCallbacks): Promise<VoiceReply | null> {
+	async #classifyReply(text: string, options: SttCallbacks, keywordsOnly: boolean): Promise<VoiceReply | null> {
 		const abort = new AbortController();
 		this.#reviewAbort = abort;
 		this.#processingTranscript = true;
@@ -811,6 +851,7 @@ export class STTController {
 				registry,
 				sessionId: this.#getSessionId?.(),
 				signal,
+				keywordsOnly,
 			});
 		} catch (error) {
 			if (!this.#disposed && !abort.signal.aborted) {
@@ -846,6 +887,7 @@ export class STTController {
 	}
 
 	async #deliverUtterance(text: string, editor: SttTarget, options: SttCallbacks): Promise<void> {
+		this.#stopContinuing();
 		const confirm = cfgSttConfirmEnabled.get(this.#settings);
 		const prefix = this.#owned.trim() ? " " : "";
 		if (!this.#reviewEnabled && !confirm && this.#wakeWords.length > 0) {
@@ -857,9 +899,7 @@ export class STTController {
 			this.#owned = "";
 			return;
 		}
-		const ready = confirm
-			? "Draft ready · say “send” to submit or “reset” to clear"
-			: "Dictation draft · review and press Send.";
+		const ready = confirm ? READY_STATUS : "Dictation draft · review and press Send.";
 		await this.#reviewDraft(text, editor, options, ready, false, prefix);
 		if (!this.#disposed && this.#streamEditor === editor && confirm) this.#startVoiceDraft();
 	}
