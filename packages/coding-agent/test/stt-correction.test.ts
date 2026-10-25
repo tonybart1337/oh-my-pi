@@ -9,6 +9,7 @@ import * as asr from "../src/stt/asr-client";
 import * as correction from "../src/stt/correction";
 import * as downloader from "../src/stt/downloader";
 import {
+	cfgSttConfirmEnabled,
 	cfgSttCorrectionEnabled,
 	cfgSttCorrectionGateEnabled,
 	cfgSttCorrectionModelEnabled,
@@ -40,16 +41,24 @@ const registry = {
 	resolver: () => () => "test-key",
 	resolveModelHeaders: async () => undefined,
 };
+/** Mirrors the TUI editor: the volatile preview is part of the text until committed or cleared. */
 function editor() {
 	let text = "";
+	let volatile = "";
 	return {
-		getText: () => text,
+		getText: () => text + volatile,
 		setText: vi.fn((value: string) => {
 			text = value;
+			volatile = "";
 		}),
-		setVolatileText: vi.fn(),
-		clearVolatileText: vi.fn(),
+		setVolatileText: vi.fn((value: string) => {
+			volatile = value;
+		}),
+		clearVolatileText: vi.fn(() => {
+			volatile = "";
+		}),
 		commitVolatileText: vi.fn((value: string) => {
+			volatile = "";
 			text += value;
 		}),
 		submit: vi.fn(),
@@ -81,6 +90,7 @@ beforeEach(async () => {
 	});
 });
 afterEach(() => {
+	vi.useRealTimers();
 	controller?.dispose();
 	controller = undefined;
 	vi.restoreAllMocks();
@@ -96,6 +106,11 @@ function create() {
 	);
 	return controller;
 }
+/** Advances fake timers, then lets the promise chains they started settle. */
+async function elapse(ms: number) {
+	vi.advanceTimersByTime(ms);
+	for (let i = 0; i < 20; i++) await Promise.resolve();
+}
 
 describe("dictation correction draft delivery", () => {
 	it.each([false, true])("never submits or strips submit words, including manualSubmit=%s", async manualSubmit => {
@@ -103,10 +118,11 @@ describe("dictation correction draft delivery", () => {
 		const target = editor();
 		const callbacks = options();
 		await create().start(target, { ...callbacks, manualSubmit });
+		// Recognized text stays visible while speaking, before review replaces it.
 		streamOptions.onPartial?.("hello");
+		expect(target.getText()).toBe("hello");
 		streamOptions.onSegment?.("hello world", 0);
-		expect(target.getText()).toBe("");
-		expect(target.setVolatileText).not.toHaveBeenCalled();
+		expect(target.getText()).toBe("hello world");
 		await controller!.stop();
 		expect(target.getText()).toBe("Hello world submit.");
 		expect(target.submit).not.toHaveBeenCalled();
@@ -219,22 +235,81 @@ describe("dictation correction draft delivery", () => {
 		expect(target.getText()).toBe("Hello world submit.");
 		expect(target.submit).not.toHaveBeenCalled();
 	});
-	it("delivers wake commands as drafts and pauses further wake input", async () => {
+	it("delivers continuous wake commands as drafts and pauses further wake input", async () => {
+		vi.useFakeTimers();
 		cfgSttWakePhrase.set(settings, "hey coach");
 		const pending = Promise.withResolvers<correction.CorrectionResult>();
 		const correct = vi.spyOn(correction, "correctTranscript").mockReturnValue(pending.promise);
 		const target = editor();
-		const callbacks = { ...options(), acceptInput: () => !target.getText() };
+		const callbacks = {
+			...options(),
+			continuous: true,
+			acceptInput: (expected: string) => target.getText() === expected,
+		};
 		await create().start(target, callbacks);
-		streamOptions.onSegment?.("hey coach hello world", 0);
+		// Lead-in words before the phrase in the same breath do not hide it.
+		streamOptions.onSegment?.("okay hey coach hello world", 0);
+		expect(target.getText()).toBe("hello world");
+		expect(correct).not.toHaveBeenCalled();
+		await elapse(700);
 		expect(target.getText()).toBe("hello world");
 		expect(target.submit).not.toHaveBeenCalled();
 		streamOptions.onSegment?.("hey coach second command", 1);
+		await elapse(700);
 		expect(correct).toHaveBeenCalledTimes(1);
 		pending.resolve({ text: "Hello world." });
-		await Promise.resolve();
-		await Promise.resolve();
+		await elapse(0);
 		expect(target.getText()).toBe("Hello world.");
+		expect(callbacks.showStatus).toHaveBeenCalledWith(
+			"Corrected: punctuation · Dictation draft · review and press Send.",
+		);
+	});
+	it.each([
+		["Yep.", "book a table for two", 1],
+		["start over", "", 0],
+		[
+			"and ask for a window seat if they have one please",
+			"book a table for two and ask for a window seat if they have one please",
+			0,
+		],
+	] as const)("open-mic voice draft answers %p", async (reply, text, submits) => {
+		vi.useFakeTimers();
+		cfgSttCorrectionEnabled.set(settings, false);
+		cfgSttConfirmEnabled.set(settings, true);
+		const target = editor();
+		const callbacks = {
+			...options(),
+			continuous: true,
+			acceptInput: (expected: string) => target.getText() === expected,
+		};
+		await create().start(target, callbacks);
+		streamOptions.onSegment?.("book a table for two", 0);
+		await elapse(700);
+		expect(target.getText()).toBe("book a table for two");
+		expect(callbacks.showStatus).toHaveBeenCalledWith("Draft ready · say “send” to submit or “reset” to clear");
+		streamOptions.onSegment?.(reply, 1);
+		await elapse(700);
+		expect(target.getText()).toBe(text);
+		expect(target.submit).toHaveBeenCalledTimes(submits);
+	});
+	it("never sends a voice draft the user edited before replying", async () => {
+		vi.useFakeTimers();
+		cfgSttCorrectionEnabled.set(settings, false);
+		cfgSttConfirmEnabled.set(settings, true);
+		const target = editor();
+		const callbacks = {
+			...options(),
+			continuous: true,
+			acceptInput: (expected: string) => target.getText() === expected,
+		};
+		await create().start(target, callbacks);
+		streamOptions.onSegment?.("book a table", 0);
+		await elapse(700);
+		target.setText("book a table, typed by hand");
+		streamOptions.onSegment?.("send", 1);
+		await elapse(700);
+		expect(target.submit).not.toHaveBeenCalled();
+		expect(target.getText()).toBe("book a table, typed by hand");
 	});
 	it("both stages disabled makes no processing calls and still requires Send", async () => {
 		cfgSttCorrectionGateEnabled.set(settings, false);
@@ -273,15 +348,13 @@ describe("dictation correction draft delivery", () => {
 
 describe("two-stage correction model execution", () => {
 	function gate(probability: number) {
-		return vi
-			.spyOn(ChainJudge.prototype, "judge")
-			.mockResolvedValue({
-				api: "typesafe",
-				provider: "typesafe",
-				model: "jev",
-				usage,
-				answers: { need_correction: { type: "noul", noul: probability } },
-			});
+		return vi.spyOn(ChainJudge.prototype, "judge").mockResolvedValue({
+			api: "typesafe",
+			provider: "typesafe",
+			model: "jev",
+			usage,
+			answers: { need_correction: { type: "noul", noul: probability } },
+		});
 	}
 	function completion(text: string) {
 		return {
