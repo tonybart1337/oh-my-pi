@@ -140,3 +140,67 @@ export async function correctTranscript(transcript: string, deps: CorrectionDepe
 	}
 	throw failure;
 }
+
+/**
+ * Short human summary of what review changed, e.g. `teh→the, goed→went; punctuation`. Words are
+ * aligned by their longest common subsequence ignoring case and punctuation, so a capital or a
+ * comma alone is reported once as "punctuation" instead of as a word edit.
+ */
+export function summarizeCorrection(original: string, corrected: string, limit = 4): string {
+	const before = original.split(/\s+/).filter(Boolean);
+	const after = corrected.split(/\s+/).filter(Boolean);
+	const bare = (word: string) =>
+		word
+			.normalize("NFKC")
+			.toLowerCase()
+			.replace(/[^\p{L}\p{N}]+/gu, "");
+	if (before.length * after.length > 250_000) return "rewrote the draft";
+	const left = before.map(bare);
+	const right = after.map(bare);
+	const width = right.length + 1;
+	const lcs = new Uint16Array((left.length + 1) * width);
+	for (let i = left.length - 1; i >= 0; i--) {
+		for (let j = right.length - 1; j >= 0; j--) {
+			lcs[i * width + j] =
+				left[i] === right[j]
+					? lcs[(i + 1) * width + j + 1]! + 1
+					: Math.max(lcs[(i + 1) * width + j]!, lcs[i * width + j + 1]!);
+		}
+	}
+	const edits: string[] = [];
+	let punctuation = false;
+	let removed: string[] = [];
+	let added: string[] = [];
+	const flush = () => {
+		if (removed.length || added.length) {
+			edits.push(
+				removed.length && added.length
+					? `${removed.join(" ")}→${added.join(" ")}`
+					: removed.length
+						? `−${removed.join(" ")}`
+						: `+${added.join(" ")}`,
+			);
+		}
+		removed = [];
+		added = [];
+	};
+	let i = 0;
+	let j = 0;
+	while (i < left.length || j < right.length) {
+		if (i < left.length && j < right.length && left[i] === right[j]) {
+			flush();
+			if (before[i] !== after[j]) punctuation = true;
+			i++;
+			j++;
+		} else if (j < right.length && (i === left.length || lcs[i * width + j + 1]! >= lcs[(i + 1) * width + j]!)) {
+			added.push(after[j++]!);
+		} else {
+			removed.push(before[i++]!);
+		}
+	}
+	flush();
+	const shown = edits.slice(0, limit).join(", ");
+	const more = edits.length > limit ? ` (+${edits.length - limit} more)` : "";
+	const parts = [shown && `${shown}${more}`, punctuation && "punctuation"].filter(Boolean);
+	return parts.length ? parts.join("; ") : "no visible changes";
+}

@@ -83,19 +83,22 @@ describe("InteractiveMode live mode vs. composer dictation", () => {
 		pendingStart.resolve();
 	});
 
-	it("pauses wake commands while the agent works or assistant speech remains audible", async () => {
+	it("pauses wake commands while the agent works, assistant speech is audible, or the draft is not dictation's", async () => {
 		const options = await wakeCallbacks();
+		expect(options.continuous).toBe(true);
 		const speaking = vi.spyOn(vocalizer, "isSpeaking").mockReturnValue(false);
 		let streaming = false;
 		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => streaming });
-		expect(options.acceptInput?.()).toBe(true);
+		expect(options.acceptInput?.("")).toBe(true);
 		streaming = true;
-		expect(options.acceptInput?.()).toBe(false);
+		expect(options.acceptInput?.("")).toBe(false);
 		streaming = false;
 		speaking.mockReturnValue(true);
-		expect(options.acceptInput?.()).toBe(false);
+		expect(options.acceptInput?.("")).toBe(false);
 		speaking.mockReturnValue(false);
-		expect(options.acceptInput?.()).toBe(true);
+		mode.editor.setText("voice draft");
+		expect(options.acceptInput?.("voice draft")).toBe(true);
+		expect(options.acceptInput?.("")).toBe(false);
 	});
 
 	it("does not duck assistant playback for the lifetime of continuous wake listening", async () => {
@@ -111,7 +114,10 @@ describe("InteractiveMode live mode vs. composer dictation", () => {
 		}
 	});
 
-	it("discards an addressed endpoint if a typed draft appears after listening starts", async () => {
+	it.each([
+		["replaced", (text: string) => mode.editor.setText(text), "typed draft stays here"],
+		["typed after the preview", (text: string) => mode.editor.insertText(text), "proposed command, then typed"],
+	] as const)("keeps the user's draft when it is %s mid-utterance", async (_case, edit, expected) => {
 		const options = await wakeCallbacks();
 		mode.settings.setModelRole("dictation", "local/nemotron-streaming-en-0.6b");
 		vi.spyOn(vocalizer, "isSpeaking").mockReturnValue(false);
@@ -130,9 +136,9 @@ describe("InteractiveMode live mode vs. composer dictation", () => {
 		try {
 			await controller.start(mode.editor, options);
 			streamOptions?.onPartial?.("hey coach proposed command");
-			mode.editor.setText("typed draft stays here");
+			edit(_case === "replaced" ? expected : ", then typed");
 			streamOptions?.onSegment?.("hey coach proposed command", 0);
-			expect(mode.editor.getText()).toBe("typed draft stays here");
+			expect(mode.editor.getText()).toBe(expected);
 			expect(submit).not.toHaveBeenCalled();
 			expect(cancel).toHaveBeenCalled();
 		} finally {
