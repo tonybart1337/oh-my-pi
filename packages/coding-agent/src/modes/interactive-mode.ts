@@ -433,7 +433,7 @@ import { cfgGoalContinuationModes, cfgGoalEnabled } from "../goals/settings";
 import { goalContinuationActivity, goalFromModeData } from "../goals/state";
 import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "../plan-mode/settings";
 import { cfgStreamRedactPatterns } from "../stream/settings";
-import { cfgSttEnabled, cfgSttWakePhrase } from "../stt/settings";
+import { cfgSttAlwaysOn, cfgSttEnabled, cfgSttWakePhrase } from "../stt/settings";
 import { combine, type SettingValueOf } from "../config/registry";
 import { cfgAdvisorEnabled, cfgAdvisorMaxNotesPerUpdate } from "../advisor/settings";
 import { cfgExtensionAssistantTextRenderers } from "../extensibility/settings";
@@ -2661,6 +2661,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		// tree before session_start hooks/reconciliation continue; renderNow keeps
 		// TUI's multiplexer, output-backlog, and image safety gates.
 		this.ui.renderNow();
+		this.#eventBusUnsubscribers.push(
+			cfgSttAlwaysOn.listen(this.settings, on => void this.#syncAlwaysOnListening(on)),
+		);
+		void this.#syncAlwaysOnListening(cfgSttAlwaysOn.get(this.settings));
 
 		const streamCwd = this.sessionManager.getCwd();
 		this.#streamPublisher =
@@ -8935,7 +8939,33 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async handleSTTToggle(): Promise<void> {
-		await this.#readySTTController()?.toggle(this.editor, this.#dictationCallbacks(this.editor));
+		await this.#readySTTController()?.toggle(
+			this.editor,
+			this.#dictationCallbacks(this.editor, false, this.#continuousToggle()),
+		);
+	}
+
+	/** The toggle key keeps listening across utterances when a wake phrase or always-on is configured. */
+	#continuousToggle(): boolean {
+		return cfgSttAlwaysOn.get(this.settings) || cfgSttWakePhrase.get(this.settings).trim().length > 0;
+	}
+
+	/** `stt.alwaysOn` arms continuous listening at startup and when enabled; disabling stops it. The
+	 *  toggle key still turns the microphone off for this session. Never starts while unavailable. */
+	async #syncAlwaysOnListening(on: boolean): Promise<void> {
+		const state = this.#sttController?.state ?? "idle";
+		if (!on) {
+			if (state === "recording") await this.#sttController?.stop();
+			return;
+		}
+		if (
+			state !== "idle" ||
+			this.#dictationStarting ||
+			this.#liveCommandController.active ||
+			!cfgSttEnabled.get(settings)
+		)
+			return;
+		await this.#readySTTController()?.start(this.editor, this.#dictationCallbacks(this.editor, false, true));
 	}
 
 	/** The composer microphone: start a draft-only capture, or stop (or cancel the start of) the running one. */
@@ -8986,13 +9016,15 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	/** Callbacks for a capture dictating into `target`: the mic glyph replaces its cursor while the
 	 *  capture runs. */
-	#dictationCallbacks(target: DictationTarget, manualSubmit = false): SttCallbacks {
-		const wakeListening = !manualSubmit && cfgSttWakePhrase.get(this.settings).trim().length > 0;
+	#dictationCallbacks(target: DictationTarget, manualSubmit = false, continuous = false): SttCallbacks {
+		const listening = continuous && !manualSubmit;
 		return {
 			manualSubmit,
-			acceptInput: () =>
+			continuous: listening,
+			// The editor must hold exactly what dictation last left there; anything else is the user's.
+			acceptInput: expectedText =>
 				target === this.editor &&
-				this.editor.getText().length === 0 &&
+				this.editor.getText() === expectedText &&
 				!this.#isAutoSubmitBlocked() &&
 				!this.#pendingSubmittedInput &&
 				this.session.queuedMessageCount === 0 &&
@@ -9000,8 +9032,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			showWarning: (msg: string) => this.showWarning(msg),
 			showStatus: (msg: string) => this.showStatus(msg),
 			onStateChange: (state: SttState) => {
-				// Continuous wake listening must not duck assistant speech for its lifetime.
-				if (state === "recording" && !wakeListening) vocalizer.duck();
+				// Continuous listening must not duck assistant speech for its lifetime.
+				if (state === "recording" && !listening) vocalizer.duck();
 				else vocalizer.unduck();
 				if (state === "recording") {
 					this.#micCursor?.dispose();

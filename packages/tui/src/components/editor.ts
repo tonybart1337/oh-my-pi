@@ -1277,6 +1277,8 @@ export class Editor implements Component, Focusable {
 	#setTextInternal(text: string, cursorAnchor: HistoryCursorAnchor = "end"): void {
 		this.#endVimSession();
 		this.#undoStack.length = 0;
+		// Replaced text no longer contains the preview, so a later clear must not delete user text.
+		this.#volatileTextLen = 0;
 		const lines = sanitizeLoadedText(text).split("\n");
 		this.#state.lines = lines.length === 0 ? [""] : lines;
 		// A single-row entry's top and bottom are the same row, so the directional

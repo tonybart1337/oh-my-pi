@@ -20,11 +20,17 @@ For press-once/start, press-again/stop dictation, use:
 app.stt.toggle: Ctrl+Space
 ```
 
-With `stt.wakePhrase: "hey coach"` and local Nemotron selected, starting dictation
-arms continuous local listening. Say the phrase and command in the same utterance,
-then pause to submit. Each command needs its own phrase. Ordinary background speech
-is discarded; the phrase by itself does not arm a later utterance. Toggle again to
-release the microphone. Neither configuration nor startup turns the microphone on.
+With local Nemotron selected, the toggle keeps listening across utterances when
+`stt.wakePhrase` is set (say “hey coach, …” in one breath, filler before the phrase
+is fine) or `stt.alwaysOn` is true (open-microphone dictation). Recognized words
+appear in the composer while you speak; a pause of `stt.utteranceEndMs` ends the
+utterance. Speech without the phrase is discarded. `stt.alwaysOn` also arms
+listening at startup; the toggle still releases the microphone. Audio stays in
+memory and is never written to disk.
+
+With `stt.confirm.enabled`, a finished utterance becomes a draft and you answer by
+voice: “send”/“yes”/“yep” submits it, “reset”/“start over” clears it, and anything
+longer is appended as more dictation. Ambiguous short replies go to the judge.
 
 ```yaml
 app.model.cycleForward: Ctrl+P

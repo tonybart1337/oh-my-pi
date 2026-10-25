@@ -9,21 +9,25 @@ import { roleCandidatePool } from "../config/model-roles";
 import { type Settings, settings } from "../config/settings";
 import type { JudgeRegistry } from "../judgment";
 import { type SttStreamHandle, sttClient } from "./asr-client";
-import { correctTranscript } from "./correction";
+import { correctTranscript, summarizeCorrection } from "./correction";
 import { downloadSttModel, isSttModelCached } from "./downloader";
 import { resolveSttModelSpec, type SttModelKey } from "./models";
 import { evaluateSubmitTrigger } from "./submit-trigger";
 import { encodePcm16Wav, floatToPcm16 } from "./wav";
 
 import {
+	cfgSttConfirmEnabled,
+	cfgSttConfirmWindowMs,
 	cfgSttCorrectionEnabled,
 	cfgSttCorrectionGateEnabled,
 	cfgSttCorrectionModelEnabled,
 	cfgSttLanguage,
 	cfgSttSubmitTrigger,
+	cfgSttUtteranceEndMs,
 	cfgSttWakePhrase,
 	cfgSttWakeTimeoutMs,
 } from "./settings";
+import { classifyVoiceReply, type VoiceReply } from "./voice-reply";
 
 export type SttState = "idle" | "recording" | "transcribing";
 
@@ -34,8 +38,15 @@ export interface SttCallbacks {
 	onStateChange(state: SttState): void;
 	/** Keep this capture as a draft, without interpreting submit commands. */
 	manualSubmit?: boolean;
-	/** Wake listening only: false discards recognition until the host can accept a new command. */
-	acceptInput?(): boolean;
+	/** Keep listening across utterances: wake-phrase commands when `stt.wakePhrase` is set, otherwise
+	 *  open-microphone dictation. Requires a local online recognizer; ignored with `manualSubmit`. */
+	continuous?: boolean;
+	/**
+	 * Continuous listening only: whether recognition may reach the editor now. `expectedText` is the
+	 * exact editor text the controller last left (its own draft and preview); any other text means the
+	 * user took over. False discards recognition until the host can accept input again.
+	 */
+	acceptInput?(expectedText: string): boolean;
 }
 
 /** The slice of a text input the controller dictates into. */
@@ -64,6 +75,14 @@ interface SttRegistry extends ModelBrowserRegistry {
 
 function supportsReview(registry: SttRegistry | undefined): registry is SttRegistry & JudgeRegistry {
 	return !!registry?.getApiKey && !!registry.resolveModelHeaders;
+}
+
+/** Joins recognized phrases with single spaces, skipping empty ones. */
+function joinWords(...parts: string[]): string {
+	return parts
+		.map(part => part.replace(/\s+/g, " ").trim())
+		.filter(Boolean)
+		.join(" ");
 }
 
 export interface STTControllerDependencies {
@@ -100,16 +119,30 @@ export class STTController {
 	#streamCommitted = false;
 	#streamAbort: AbortController | null = null;
 	#streamUtterance = "";
+
+	// Continuous listening: wake-phrase commands, or open-microphone dictation when always-on.
+	#continuous = false;
 	#wakePhrase = "";
 	#wakeWords: string[] = [];
-	#wakeStatus = "";
+	#listenStatus = "";
+	/** Set while recognition is paused for unavailable input, so resuming announces listening again. */
+	#paused = false;
 	#wakeTimeoutMs = 15_000;
-	#wakeDeadline: number | null = null;
+	/** A phrase-only utterance opens this window, in which the next speech is the command. */
+	#wakeOpenUntil: number | null = null;
 	#wakeTimer: Timer | undefined;
-	/** A recognized command beginning inside the window may finish after its deadline. */
-	#wakeCommandStarted = false;
-	/** Until this segment ends, a partial prefix must still be present in its final transcript. */
-	#wakePhraseInSegment = false;
+	/** Recognized command text of the utterance in progress; segments join until a quiet gap ends it. */
+	#utterance = "";
+	/** The utterance in progress was addressed (wake phrase or open microphone), not just a reply. */
+	#utteranceAddressed = false;
+	#utteranceTimer: Timer | undefined;
+	/** Volatile preview currently inserted after {@link #owned}. */
+	#preview = "";
+	/** Exact editor text (without preview) this controller last left; anything else is the user's. */
+	#owned = "";
+	/** A ready voice draft awaiting a spoken send/reset. Wake listening accepts unaddressed replies until `until`. */
+	#voiceDraft: { until: number | null } | null = null;
+	#voiceDraftTimer: Timer | undefined;
 
 	// Buffered cloud capture.
 	#cloudModel: Model<Api> | null = null;
@@ -254,12 +287,14 @@ export class STTController {
 		}
 	}
 
-	#supportsWakePhrase(model: Model<Api> | undefined, options: SttCallbacks): boolean {
+	#supportsContinuous(model: Model<Api> | undefined, options: SttCallbacks): boolean {
 		const spec = resolveSttModelSpec(model?.id);
 		if ((!model || model.api === "local-inference") && spec.engine === "sherpa" && spec.mode === "online") {
 			return true;
 		}
-		options.showWarning("Wake-phrase listening requires a local online speech-to-text model (Nemotron streaming).");
+		options.showWarning(
+			"Continuous listening (wake phrase or always-on) requires a local online speech-to-text model (Nemotron streaming).",
+		);
 		return false;
 	}
 
@@ -267,7 +302,8 @@ export class STTController {
 		this.#reviewEnabled = cfgSttCorrectionEnabled.get(this.#settings);
 		this.#reviewSegments = "";
 		this.#reviewPartial = "";
-		const wakePhrase = options.manualSubmit ? "" : cfgSttWakePhrase.get(this.#settings).trim();
+		const continuous = options.continuous === true && !options.manualSubmit;
+		const wakePhrase = continuous ? cfgSttWakePhrase.get(this.#settings).trim() : "";
 		if (wakePhrase && !/[\p{L}\p{N}]/u.test(wakePhrase)) {
 			options.showWarning("The speech-to-text wake phrase must contain words.");
 			return;
@@ -286,7 +322,7 @@ export class STTController {
 			if (qualified) options.showWarning(`Dictation model ${qualified} not found; using the built-in local model`);
 		}
 		let model = first?.model;
-		if (wakePhrase && !this.#supportsWakePhrase(model, options)) return;
+		if (continuous && !this.#supportsContinuous(model, options)) return;
 		if (model?.api === "openai-transcriptions") {
 			this.#startBuffered(editor, options, model);
 			return;
@@ -299,7 +335,7 @@ export class STTController {
 		let modelKey = await this.#ensureDeps(options, this.#resolveModelKey(model), signal);
 		if (!modelKey || signal.aborted) return;
 		model = this.#resolveCandidate()?.model;
-		if (wakePhrase && !this.#supportsWakePhrase(model, options)) return;
+		if (continuous && !this.#supportsContinuous(model, options)) return;
 		if (model?.api === "openai-transcriptions") {
 			this.#startBuffered(editor, options, model);
 			return;
@@ -313,7 +349,7 @@ export class STTController {
 			modelKey = await this.#ensureDeps(options, startModelKey, signal);
 			if (!modelKey || signal.aborted) return;
 		}
-		await this.#startStreaming(editor, options, modelKey, wakePhrase);
+		await this.#startStreaming(editor, options, modelKey, wakePhrase, continuous);
 	}
 
 	async #stop(options: SttCallbacks): Promise<void> {
@@ -447,9 +483,13 @@ export class STTController {
 		return this.#streamCommitted ? ` ${normalized}` : normalized;
 	}
 
+	/** Classic capture: recognized text stays visible while speaking, in review mode too, so the
+	 *  reviewed draft can be compared with what was heard. */
 	#previewTranscript(text: string): void {
 		if (this.#reviewEnabled) {
 			this.#reviewPartial = text.trim();
+			const preview = joinWords(this.#reviewSegments, this.#reviewPartial);
+			if (preview) this.#streamEditor?.setVolatileText(preview);
 			return;
 		}
 		this.#streamEditor?.setVolatileText(this.#prefixed(text));
@@ -457,8 +497,9 @@ export class STTController {
 
 	#commitTranscriptSegment(text: string): void {
 		if (this.#reviewEnabled) {
-			if (text.trim()) this.#reviewSegments += `${this.#reviewSegments ? " " : ""}${text.trim()}`;
+			this.#reviewSegments = joinWords(this.#reviewSegments, text);
 			this.#reviewPartial = "";
+			if (this.#reviewSegments) this.#streamEditor?.setVolatileText(this.#reviewSegments);
 			return;
 		}
 		const prefixed = this.#prefixed(text);
@@ -469,26 +510,31 @@ export class STTController {
 		} else this.#streamEditor?.clearVolatileText();
 	}
 
-	async #deliverWakeCommand(command: string): Promise<void> {
-		const editor = this.#streamEditor;
-		const options = this.#streamCallbacks;
-		if (!editor || !options || this.#disposed || this.#processingTranscript) return;
-		if (this.#reviewEnabled) await this.#reviewDraft(command, editor, options);
-		else {
-			editor.commitVolatileText(command);
-			editor.submit();
-		}
-	}
-
-	async #reviewDraft(original: string, editor: SttTarget, options: SttCallbacks, failed = false): Promise<void> {
-		// The original is durable before any model call. Edits, Send, cancellation,
-		// and failures can never strand a transcript in an asynchronous operation.
+	/**
+	 * Inserts `prefix + original` as an editable draft in place of any volatile preview, then lets
+	 * review replace exactly that insertion. The original is durable before any model call; edits,
+	 * Send, cancellation and failures never lose it or overwrite the user's own changes.
+	 */
+	async #reviewDraft(
+		original: string,
+		editor: SttTarget,
+		options: SttCallbacks,
+		ready: string,
+		failed = false,
+		prefix = "",
+	): Promise<void> {
+		editor.clearVolatileText();
+		this.#preview = "";
 		const before = editor.getText?.();
-		editor.commitVolatileText(original);
+		const inserted = prefix + original;
+		editor.commitVolatileText(inserted);
 		const expected = editor.getText?.();
-		options.showStatus("Dictation draft · review and press Send.");
+		this.#owned = expected ?? "";
+		this.#listenStatus = "";
+		options.showStatus(ready);
 		if (
 			failed ||
+			!this.#reviewEnabled ||
 			(!cfgSttCorrectionGateEnabled.get(this.#settings) && !cfgSttCorrectionModelEnabled.get(this.#settings))
 		)
 			return;
@@ -505,21 +551,20 @@ export class STTController {
 				return;
 			if (result.warning) options.showWarning(result.warning);
 			const corrected = result.text;
-			if (corrected !== original) {
-				// Replace only our unchanged insertion. Never replace a user's typed,
-				// edited, submitted, or switched-away draft with a late model result.
-				let index = expected?.indexOf(original) ?? -1;
-				while (index >= 0 && expected!.slice(0, index) + expected!.slice(index + original.length) !== before) {
-					index = expected!.indexOf(original, index + 1);
-				}
-				if (index >= 0 && expected !== undefined && editor.setText && editor.getText?.() === expected) {
-					editor.setText(expected.slice(0, index) + corrected + expected.slice(index + original.length));
-				} else
-					options.showWarning(
-						"Dictation draft changed during correction; kept your draft without overwriting it.",
-					);
+			if (corrected === original) return;
+			// Replace only our unchanged insertion. Never replace a user's typed,
+			// edited, submitted, or switched-away draft with a late model result.
+			let index = expected?.indexOf(inserted) ?? -1;
+			while (index >= 0 && expected!.slice(0, index) + expected!.slice(index + inserted.length) !== before) {
+				index = expected!.indexOf(inserted, index + 1);
 			}
-			options.showStatus("Dictation draft · review and press Send.");
+			if (index >= 0 && expected !== undefined && editor.setText && editor.getText?.() === expected) {
+				editor.setText(expected.slice(0, index) + prefix + corrected + expected.slice(index + inserted.length));
+				this.#owned = editor.getText?.() ?? "";
+				options.showStatus(`Corrected: ${summarizeCorrection(original, corrected)} · ${ready}`);
+			} else {
+				options.showWarning("Dictation draft changed during correction; kept your draft without overwriting it.");
+			}
 		} catch (error) {
 			if (!this.#disposed && !abort.signal.aborted) {
 				options.showWarning(
@@ -534,157 +579,307 @@ export class STTController {
 		}
 	}
 
-	/** Match complete normalized words at the prefix, retaining the command's original spelling. */
-	#stripWakePhrase(text: string): string | null {
-		let index = 0;
-		for (const word of text.matchAll(/[\p{L}\p{N}]+/gu)) {
-			if (word[0].normalize("NFKC").toLowerCase() !== this.#wakeWords[index]) return null;
-			if (++index === this.#wakeWords.length) {
-				return text
-					.slice(word.index + word[0].length)
-					.replace(/^[\s\p{P}\p{S}]+/u, "")
-					.trim();
-			}
+	// ── Continuous listening ────────────────────────────────────────
+
+	/** Text after the last complete wake phrase anywhere in `text` ("" when it ends there), or null.
+	 *  Leading filler or a cut-off previous sentence in the same segment must not hide the phrase. */
+	#afterWakePhrase(text: string): string | null {
+		const words = [...text.matchAll(/[\p{L}\p{N}]+/gu)];
+		const length = this.#wakeWords.length;
+		for (let start = words.length - length; start >= 0; start--) {
+			const matches = this.#wakeWords.every(
+				(word, offset) => words[start + offset]![0].normalize("NFKC").toLowerCase() === word,
+			);
+			if (!matches) continue;
+			const last = words[start + length - 1]!;
+			return text
+				.slice(last.index + last[0].length)
+				.replace(/^[\s\p{P}\p{S}]+/u, "")
+				.trim();
 		}
 		return null;
 	}
 
-	#showWakeStatus(message: string): void {
-		if (message === this.#wakeStatus) return;
-		this.#wakeStatus = message;
+	#wakeWindowOpen(): boolean {
+		return this.#wakeOpenUntil !== null && Date.now() < this.#wakeOpenUntil;
+	}
+
+	#replyWindowOpen(): boolean {
+		return this.#voiceDraft !== null && (this.#voiceDraft.until === null || Date.now() < this.#voiceDraft.until);
+	}
+
+	/** The part of recognized `text` meant for the editor, or null for speech to ignore. Open-mic
+	 *  speech is always addressed; wake listening needs the phrase, its open window, the utterance it
+	 *  already started, or (unaddressed) a reply while a voice draft awaits confirmation. */
+	#heard(text: string): { command: string; addressed: boolean } | null {
+		if (this.#wakeWords.length === 0) return { command: text.trim(), addressed: true };
+		const command = this.#afterWakePhrase(text);
+		if (command !== null) return { command, addressed: true };
+		if (this.#utterance) return { command: text.trim(), addressed: this.#utteranceAddressed };
+		if (this.#wakeWindowOpen()) return { command: text.trim(), addressed: true };
+		if (this.#replyWindowOpen()) return { command: text.trim(), addressed: false };
+		return null;
+	}
+
+	#showListenStatus(message: string): void {
+		if (message === this.#listenStatus) return;
+		this.#listenStatus = message;
 		this.#streamCallbacks?.showStatus(message);
 	}
 
-	#wakeListeningStatus(): string {
-		return `Microphone on · listening for “${this.#wakePhrase} …”`;
+	#idleListenStatus(): string {
+		if (this.#voiceDraft) {
+			return this.#replyWindowOpen()
+				? "Draft ready · say “send” to submit or “reset” to clear"
+				: `Draft ready · say “${this.#wakePhrase}, send” or “${this.#wakePhrase}, reset”`;
+		}
+		return this.#wakeWords.length > 0
+			? `Microphone on · listening for “${this.#wakePhrase} …”`
+			: "Microphone on · hands-free dictation";
 	}
 
-	#wakeCurrentStatus(): string {
-		return this.#wakeDeadline === null
-			? this.#wakeListeningStatus()
-			: "Microphone on · wake phrase detected; listening for command";
+	/** Whether the editor still holds exactly this controller's draft and preview. After the user
+	 *  types or replaces text, clearing or committing the preview would delete their characters. */
+	#previewIntact(): boolean {
+		const text = this.#streamEditor?.getText?.();
+		return text === undefined || text === this.#owned + this.#preview;
 	}
 
-	#resetWakeWindow(): void {
+	#showPreview(text: string): void {
+		const value = text ? `${this.#owned.trim() ? " " : ""}${text}` : "";
+		if (value === this.#preview) return;
+		this.#preview = value;
+		if (value) this.#streamEditor?.setVolatileText(value);
+		else this.#streamEditor?.clearVolatileText();
+	}
+
+	#openWakeWindow(): void {
+		clearTimeout(this.#wakeTimer);
+		this.#wakeOpenUntil = Date.now() + this.#wakeTimeoutMs;
+		this.#wakeTimer = setTimeout(() => {
+			this.#wakeTimer = undefined;
+			this.#wakeOpenUntil = null;
+			if (!this.#utterance && this.#state === "recording") this.#showListenStatus(this.#idleListenStatus());
+		}, this.#wakeTimeoutMs);
+		this.#showListenStatus(`“${this.#wakePhrase}” heard · listening for your command`);
+	}
+
+	#closeWakeWindow(): void {
 		clearTimeout(this.#wakeTimer);
 		this.#wakeTimer = undefined;
-		this.#wakeDeadline = null;
-		this.#wakeCommandStarted = false;
-		this.#wakePhraseInSegment = false;
+		this.#wakeOpenUntil = null;
 	}
 
-	#cancelWakeStream(): void {
+	#dropUtterance(): void {
+		clearTimeout(this.#utteranceTimer);
+		this.#utteranceTimer = undefined;
+		this.#utterance = "";
+		this.#utteranceAddressed = false;
+		this.#closeWakeWindow();
+		this.#showPreview("");
+	}
+
+	#cancelStream(): void {
 		const stream = this.#stream;
 		this.#stream = null;
 		stream?.cancel();
 	}
 
-	#expireWakeWindow(): void {
-		this.#resetWakeWindow();
-		this.#cancelWakeStream();
-		if (!this.#disposed && this.#state === "recording" && this.#acceptWakeInput()) {
-			this.#showWakeStatus(this.#wakeListeningStatus());
-		}
+	#startVoiceDraft(): void {
+		this.#clearVoiceDraft();
+		const windowMs = cfgSttConfirmWindowMs.get(this.#settings);
+		const wake = this.#wakeWords.length > 0;
+		this.#voiceDraft = { until: wake ? Date.now() + windowMs : null };
+		if (!wake) return;
+		this.#voiceDraftTimer = setTimeout(() => {
+			this.#voiceDraftTimer = undefined;
+			if (this.#voiceDraft && !this.#utterance && this.#state === "recording") {
+				this.#showListenStatus(this.#idleListenStatus());
+			}
+		}, windowMs);
 	}
 
-	#scheduleWakeExpiry(): void {
-		clearTimeout(this.#wakeTimer);
-		this.#wakeTimer = undefined;
-		if (this.#wakeDeadline === null) return;
-		const remaining = this.#wakeDeadline - Date.now();
-		if (remaining <= 0) {
-			this.#expireWakeWindow();
-			return;
-		}
-		this.#wakeTimer = setTimeout(() => this.#expireWakeWindow(), remaining);
+	#clearVoiceDraft(): void {
+		clearTimeout(this.#voiceDraftTimer);
+		this.#voiceDraftTimer = undefined;
+		this.#voiceDraft = null;
 	}
 
-	#observeWakePartial(text: string): void {
-		if (this.#wakeDeadline !== null && !this.#wakeCommandStarted && Date.now() >= this.#wakeDeadline) {
-			this.#expireWakeWindow();
-			return;
+	/** Whether recognition may reach the editor now. An editor emptied by Send or a manual clear
+	 *  releases this controller's draft; any other change means the user took over. Unavailable input
+	 *  drops the utterance in flight and its native stream, so resuming never replays stale or echoed
+	 *  speech. Review and reply checks pause recognition the same way. */
+	#acceptContinuousInput(): boolean {
+		if (!this.#processingTranscript) {
+			const accept = this.#streamCallbacks?.acceptInput;
+			if (!accept || accept(this.#owned + this.#preview)) return true;
+			if ((this.#owned || this.#preview) && accept("")) {
+				this.#owned = "";
+				this.#preview = "";
+				this.#clearVoiceDraft();
+				return true;
+			}
 		}
-		const stripped = this.#stripWakePhrase(text);
-		if (this.#wakeDeadline === null) {
-			if (stripped === null) return;
-			this.#wakeDeadline = Date.now() + this.#wakeTimeoutMs;
-			this.#wakePhraseInSegment = true;
-			this.#scheduleWakeExpiry();
+		// The user took over: forget the preview without touching their text.
+		if (!this.#previewIntact()) this.#preview = "";
+		this.#dropUtterance();
+		this.#cancelStream();
+		if (!this.#processingTranscript) {
+			this.#paused = true;
+			this.#showListenStatus("Microphone on · listening paused while input is unavailable");
 		}
-		const command = stripped ?? (this.#wakePhraseInSegment ? "" : text.trim());
-		if (command) {
-			this.#wakeCommandStarted = true;
-			clearTimeout(this.#wakeTimer);
-			this.#wakeTimer = undefined;
-		}
-		this.#showWakeStatus(this.#wakeCurrentStatus());
-	}
-
-	#takeWakeCommand(text: string): string | null {
-		if (this.#wakeDeadline !== null && !this.#wakeCommandStarted && Date.now() >= this.#wakeDeadline) {
-			this.#expireWakeWindow();
-			return null;
-		}
-		const stripped = this.#stripWakePhrase(text);
-		if (this.#wakeDeadline === null) {
-			if (stripped === null) return null;
-			this.#wakeDeadline = Date.now() + this.#wakeTimeoutMs;
-			this.#wakePhraseInSegment = true;
-		}
-		const command = stripped ?? (this.#wakePhraseInSegment ? null : text.trim());
-		if (command) {
-			this.#resetWakeWindow();
-			return command;
-		}
-		if (stripped === "") {
-			// A phrase-only endpoint opens the next segment, without restarting the
-			// window already announced by its first matching partial.
-			this.#wakePhraseInSegment = false;
-			this.#wakeCommandStarted = false;
-			this.#scheduleWakeExpiry();
-		} else {
-			this.#resetWakeWindow();
-		}
-		return null;
-	}
-
-	#acceptWakeInput(): boolean {
-		if (!this.#processingTranscript && this.#streamCallbacks?.acceptInput?.() !== false) return true;
-		// Drop the native utterance as well as any in-flight text, so resuming cannot
-		// complete assistant echo or a command spoken while the host was busy.
-		this.#resetWakeWindow();
-		this.#cancelWakeStream();
-		this.#showWakeStatus("Microphone on · wake listening paused while input is unavailable");
 		return false;
+	}
+
+	#onContinuousPartial(text: string): void {
+		if (!text.trim() || !this.#acceptContinuousInput()) return;
+		const heard = this.#heard(text);
+		if (!heard) return;
+		// Speech resumed: the utterance is not finished yet.
+		clearTimeout(this.#utteranceTimer);
+		this.#utteranceTimer = undefined;
+		if (!heard.command) {
+			if (!this.#utterance) this.#showListenStatus(`“${this.#wakePhrase}” heard · listening for your command`);
+			return;
+		}
+		this.#showPreview(joinWords(this.#utterance, heard.command));
+		this.#showListenStatus(heard.addressed ? "Listening…" : "Listening for your reply…");
+	}
+
+	#onContinuousSegment(text: string): void {
+		if (this.#state !== "recording" || !this.#acceptContinuousInput()) return;
+		const heard = this.#heard(text);
+		if (!heard) {
+			if (!this.#utterance) this.#showPreview("");
+			return;
+		}
+		if (!heard.command) {
+			// A phrase-only segment: the next speech within the window is the command.
+			if (!this.#utterance) this.#openWakeWindow();
+			return;
+		}
+		this.#closeWakeWindow();
+		this.#utteranceAddressed ||= heard.addressed;
+		this.#utterance = joinWords(this.#utterance, heard.command);
+		this.#showPreview(this.#utterance);
+		clearTimeout(this.#utteranceTimer);
+		this.#utteranceTimer = setTimeout(() => void this.#finishUtterance(), cfgSttUtteranceEndMs.get(this.#settings));
+	}
+
+	/** The speaker paused long enough: the utterance is either a reply to a ready draft or new text. */
+	async #finishUtterance(): Promise<void> {
+		this.#utteranceTimer = undefined;
+		const text = this.#utterance;
+		const addressed = this.#utteranceAddressed;
+		this.#utterance = "";
+		this.#utteranceAddressed = false;
+		const editor = this.#streamEditor;
+		const options = this.#streamCallbacks;
+		if (!text || !editor || !options || this.#disposed || !this.#acceptContinuousInput()) return;
+		if (this.#voiceDraft) {
+			const reply = await this.#classifyReply(text, options);
+			if (this.#disposed || this.#streamEditor !== editor) return;
+			if (reply === null) {
+				this.#showPreview("");
+				return;
+			}
+			if (reply !== "other") {
+				this.#applyReply(reply, editor, options);
+				return;
+			}
+			if (!addressed) {
+				this.#showPreview("");
+				this.#listenStatus = "";
+				this.#showListenStatus(`Not a send or reset · ${this.#idleListenStatus()}`);
+				return;
+			}
+		}
+		await this.#deliverUtterance(text, editor, options);
+	}
+
+	async #classifyReply(text: string, options: SttCallbacks): Promise<VoiceReply | null> {
+		const abort = new AbortController();
+		this.#reviewAbort = abort;
+		this.#processingTranscript = true;
+		this.#listenStatus = "";
+		options.showStatus("Checking your reply…");
+		try {
+			const signal = this.#streamAbort ? AbortSignal.any([abort.signal, this.#streamAbort.signal]) : abort.signal;
+			const registry = supportsReview(this.#registry) ? this.#registry : undefined;
+			return await classifyVoiceReply(text, this.#owned, {
+				settings: this.#settings,
+				registry,
+				sessionId: this.#getSessionId?.(),
+				signal,
+			});
+		} catch (error) {
+			if (!this.#disposed && !abort.signal.aborted) {
+				options.showWarning(
+					`Could not interpret the spoken reply; draft kept. ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+			return null;
+		} finally {
+			if (this.#reviewAbort === abort) {
+				this.#reviewAbort = null;
+				this.#processingTranscript = false;
+			}
+		}
+	}
+
+	#applyReply(reply: "send" | "reset", editor: SttTarget, options: SttCallbacks): void {
+		this.#showPreview("");
+		this.#listenStatus = "";
+		if (editor.getText?.() !== this.#owned || (reply === "reset" && !editor.setText)) {
+			options.showWarning("The draft changed before your spoken reply; nothing was sent or cleared.");
+			return;
+		}
+		this.#clearVoiceDraft();
+		this.#owned = "";
+		if (reply === "send") {
+			editor.submit();
+			options.showStatus("Sent by voice.");
+		} else {
+			editor.setText!("");
+			options.showStatus("Draft cleared by voice.");
+		}
+	}
+
+	async #deliverUtterance(text: string, editor: SttTarget, options: SttCallbacks): Promise<void> {
+		const confirm = cfgSttConfirmEnabled.get(this.#settings);
+		const prefix = this.#owned.trim() ? " " : "";
+		if (!this.#reviewEnabled && !confirm && this.#wakeWords.length > 0) {
+			// Without review or spoken confirmation, an addressed wake command is sent at once.
+			editor.clearVolatileText();
+			this.#preview = "";
+			editor.commitVolatileText(prefix + text);
+			editor.submit();
+			this.#owned = "";
+			return;
+		}
+		const ready = confirm
+			? "Draft ready · say “send” to submit or “reset” to clear"
+			: "Dictation draft · review and press Send.";
+		await this.#reviewDraft(text, editor, options, ready, false, prefix);
+		if (!this.#disposed && this.#streamEditor === editor && confirm) this.#startVoiceDraft();
 	}
 
 	#openStream(modelKey: SttModelKey, language: string): SttStreamHandle {
 		const stream = sttClient.startStream(modelKey, {
 			language: language || undefined,
 			signal: this.#streamAbort?.signal,
-			discardTranscript: this.#wakeWords.length > 0,
+			discardTranscript: this.#continuous,
 			onPartial: text => {
 				if (this.#disposed || this.#stream !== stream || this.#state !== "recording") return;
-				if (this.#wakeWords.length > 0) {
-					if (!this.#acceptWakeInput()) return;
-					this.#observeWakePartial(text);
-					return;
-				}
-				this.#previewTranscript(text);
+				if (this.#continuous) this.#onContinuousPartial(text);
+				else this.#previewTranscript(text);
 			},
 			onSegment: text => {
 				if (this.#disposed || this.#stream !== stream) return;
-				if (this.#wakeWords.length > 0) {
-					if (this.#state !== "recording" || !this.#acceptWakeInput()) return;
-					// A fresh command must not inherit the previous utterance's native
-					// decoder/cache context, including discarded ambient speech.
-					this.#cancelWakeStream();
-					const command = this.#takeWakeCommand(text);
-					if (command) void this.#deliverWakeCommand(command);
-					else if (this.#acceptWakeInput()) this.#showWakeStatus(this.#wakeCurrentStatus());
-					return;
-				}
-				this.#commitTranscriptSegment(text);
+				// The worker resets the recognizer at every endpoint, so one stream carries every
+				// utterance; reopening it per segment would drop audio queued past the endpoint.
+				if (this.#continuous) this.#onContinuousSegment(text);
+				else this.#commitTranscriptSegment(text);
 			},
 		});
 		return stream;
@@ -695,6 +890,7 @@ export class STTController {
 		options: SttCallbacks,
 		modelKey: SttModelKey,
 		wakePhrase: string,
+		continuous: boolean,
 	): Promise<void> {
 		const language = cfgSttLanguage.get(this.#settings);
 		this.#streamEditor = editor;
@@ -703,7 +899,7 @@ export class STTController {
 		this.#streamUtterance = "";
 		const abort = new AbortController();
 		this.#streamAbort = abort;
-		this.#resetWakeWindow();
+		this.#continuous = continuous;
 		this.#wakeTimeoutMs = cfgSttWakeTimeoutMs.get(this.#settings);
 		this.#wakePhrase = wakePhrase;
 		this.#wakeWords =
@@ -729,22 +925,26 @@ export class STTController {
 					}
 					this.#streamAbort?.abort(error);
 					this.#stream?.cancel();
-					if (this.#wakeWords.length === 0) {
-						if (this.#reviewEnabled) {
-							const text = [this.#reviewSegments, this.#reviewPartial].filter(Boolean).join(" ");
-							if (text) this.#streamEditor?.commitVolatileText(text);
-						} else this.#streamEditor?.clearVolatileText();
-					}
+					if (this.#continuous) {
+						// Keep what was heard of an unfinished utterance as raw draft text.
+						if (this.#preview && this.#previewIntact()) this.#streamEditor?.commitVolatileText(this.#preview);
+					} else if (this.#reviewEnabled) {
+						const text = joinWords(this.#reviewSegments, this.#reviewPartial);
+						if (text) this.#streamEditor?.commitVolatileText(text);
+					} else this.#streamEditor?.clearVolatileText();
 					this.#cleanupStream();
 					this.#setState("idle", options);
 					options.showWarning(error.message);
 					return;
 				}
-				if (this.#wakeWords.length > 0) {
-					if (!this.#acceptWakeInput()) return;
+				if (this.#continuous) {
+					if (!this.#acceptContinuousInput()) return;
 					if (!this.#stream) {
 						this.#stream = this.#openStream(modelKey, language);
-						this.#showWakeStatus(this.#wakeCurrentStatus());
+						if (this.#paused) {
+							this.#paused = false;
+							this.#showListenStatus(this.#idleListenStatus());
+						}
 					}
 				}
 				this.#stream?.pushAudio(samples);
@@ -759,28 +959,29 @@ export class STTController {
 		}
 		this.#streamRecorder = recorder;
 		this.#setState("recording", options);
-		if (this.#wakeWords.length > 0 && this.#acceptWakeInput()) this.#showWakeStatus(this.#wakeListeningStatus());
-		logger.debug("STT live recording started", { modelKey });
+		if (this.#continuous && this.#acceptContinuousInput()) this.#showListenStatus(this.#idleListenStatus());
+		logger.debug("STT live recording started", { modelKey, continuous });
 	}
 
 	async #stopStreaming(options: SttCallbacks): Promise<void> {
 		const stream = this.#stream;
 		const recorder = this.#streamRecorder;
-		if (this.#wakeWords.length > 0) {
-			// Toggle-off is cancellation, not an utterance endpoint: do not flush a
-			// pending command or replay the worker's joined ambient transcript.
+		if (this.#continuous) {
+			// Toggle-off ends listening, not an utterance: nothing is reviewed or sent, and the
+			// worker's ambient transcript is never replayed. Text already heard stays as raw draft.
 			this.#setState("transcribing", options);
 			try {
 				recorder?.stop();
 			} catch (err) {
-				logger.debug("stt: wake recorder stop failed", { error: String(err) });
+				logger.debug("stt: continuous recorder stop failed", { error: String(err) });
 			}
+			if (this.#preview && this.#previewIntact()) this.#streamEditor?.commitVolatileText(this.#preview);
 			this.#streamAbort?.abort();
 			this.#reviewAbort?.abort();
 			stream?.cancel();
 			this.#cleanupStream();
 			this.#setState("idle", options);
-			options.showStatus("Wake-phrase listening stopped.");
+			options.showStatus("Listening stopped.");
 			return;
 		}
 		if (!stream) {
@@ -827,19 +1028,38 @@ export class STTController {
 		this.#streamCommitted = false;
 		this.#streamAbort = null;
 		this.#streamUtterance = "";
+		clearTimeout(this.#utteranceTimer);
+		this.#utteranceTimer = undefined;
+		this.#closeWakeWindow();
+		this.#clearVoiceDraft();
+		this.#continuous = false;
 		this.#wakePhrase = "";
 		this.#wakeWords = [];
-		this.#wakeStatus = "";
-		this.#resetWakeWindow();
+		this.#listenStatus = "";
+		this.#paused = false;
+		this.#utterance = "";
+		this.#utteranceAddressed = false;
+		this.#preview = "";
+		this.#owned = "";
 	}
 
 	async #finishTranscript(finalText: string, failed: boolean, options: SttCallbacks): Promise<void> {
 		if (this.#reviewEnabled) {
-			const text = finalText || [this.#reviewSegments, this.#reviewPartial].filter(Boolean).join(" ");
+			const text = finalText || joinWords(this.#reviewSegments, this.#reviewPartial);
 			this.#reviewSegments = "";
 			this.#reviewPartial = "";
-			if (text && this.#streamEditor) await this.#reviewDraft(text, this.#streamEditor, options, failed);
-			else if (!failed) options.showStatus("No speech detected.");
+			if (text && this.#streamEditor) {
+				await this.#reviewDraft(
+					text,
+					this.#streamEditor,
+					options,
+					"Dictation draft · review and press Send.",
+					failed,
+				);
+			} else {
+				this.#streamEditor?.clearVolatileText();
+				if (!failed) options.showStatus("No speech detected.");
+			}
 			return;
 		}
 		if (!this.#streamCommitted && finalText) {
@@ -866,8 +1086,8 @@ export class STTController {
 
 	dispose(): void {
 		if (this.#disposed) return;
-		if (this.#reviewEnabled && !this.#processingTranscript && this.#wakeWords.length === 0) {
-			const text = [this.#reviewSegments, this.#reviewPartial].filter(Boolean).join(" ");
+		if (this.#reviewEnabled && !this.#processingTranscript && !this.#continuous) {
+			const text = joinWords(this.#reviewSegments, this.#reviewPartial);
 			if (text) this.#streamEditor?.commitVolatileText(text);
 		}
 		this.#disposed = true;
