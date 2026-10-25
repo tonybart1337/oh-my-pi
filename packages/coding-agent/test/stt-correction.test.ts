@@ -272,6 +272,7 @@ describe("dictation correction draft delivery", () => {
 			"book a table for two and ask for a window seat if they have one please",
 			0,
 		],
+		["Continue, at eight.", "book a table for two at eight.", 0],
 	] as const)("open-mic voice draft answers %p", async (reply, text, submits) => {
 		vi.useFakeTimers();
 		cfgSttCorrectionEnabled.set(settings, false);
@@ -286,11 +287,39 @@ describe("dictation correction draft delivery", () => {
 		streamOptions.onSegment?.("book a table for two", 0);
 		await elapse(700);
 		expect(target.getText()).toBe("book a table for two");
-		expect(callbacks.showStatus).toHaveBeenCalledWith("Draft ready · say “send” to submit or “reset” to clear");
+		expect(callbacks.showStatus).toHaveBeenCalledWith("Draft ready · say “send”, “continue” or “reset”");
 		streamOptions.onSegment?.(reply, 1);
 		await elapse(700);
 		expect(target.getText()).toBe(text);
 		expect(target.submit).toHaveBeenCalledTimes(submits);
+	});
+	it.each(["", "hey coach"])("“continue” reopens the draft for more dictation (wake phrase %p)", async phrase => {
+		vi.useFakeTimers();
+		cfgSttWakePhrase.set(settings, phrase);
+		cfgSttCorrectionEnabled.set(settings, false);
+		cfgSttConfirmEnabled.set(settings, true);
+		const judge = vi.spyOn(ChainJudge.prototype, "judge");
+		const target = editor();
+		const callbacks = {
+			...options(),
+			continuous: true,
+			acceptInput: (expected: string) => target.getText() === expected,
+		};
+		await create().start(target, callbacks);
+		streamOptions.onSegment?.(`${phrase} book a table for two`, 0);
+		await elapse(700);
+		streamOptions.onSegment?.("continue", 1);
+		await elapse(700);
+		expect(callbacks.showStatus).toHaveBeenLastCalledWith("Continuing · keep dictating");
+		// Past the wake reply window, short words still count as dictation, not a reply for the judge.
+		vi.advanceTimersByTime(10_000);
+		streamOptions.onSegment?.("at eight", 2);
+		await elapse(700);
+		expect(target.getText()).toBe("book a table for two at eight");
+		expect(judge).not.toHaveBeenCalled();
+		streamOptions.onSegment?.("send", 3);
+		await elapse(700);
+		expect(target.submit).toHaveBeenCalledTimes(1);
 	});
 	it("never sends a voice draft the user edited before replying", async () => {
 		vi.useFakeTimers();

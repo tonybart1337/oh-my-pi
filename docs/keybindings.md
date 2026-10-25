@@ -29,8 +29,9 @@ listening at startup; the toggle still releases the microphone. Audio stays in
 memory and is never written to disk.
 
 With `stt.confirm.enabled`, a finished utterance becomes a draft and you answer by
-voice: “send”/“yes”/“yep” submits it, “reset”/“start over” clears it, and anything
-longer is appended as more dictation. Ambiguous short replies go to the judge.
+voice: “send”/“yes”/“yep” submits it, “reset”/“start over” clears it, “continue”
+goes back to dictating into it, and anything longer is appended as more dictation.
+Ambiguous short replies go to the judge.
 
 ```yaml
 app.model.cycleForward: Ctrl+P

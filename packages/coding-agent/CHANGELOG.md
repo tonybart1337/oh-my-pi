@@ -438,7 +438,7 @@
 - Added provider-scoped model-ID glob keys in retry fallback chains, with ordinary latest-family and effort selectors as fallback targets
 - Added opt-in local `stt.wakePhrase` listening: explicitly arm Nemotron dictation and address each utterance with a phrase, anywhere in one breath; ambient, busy/echoed, and cancelled speech is discarded
 - Added `stt.alwaysOn` continuous listening (wake phrase or open-microphone dictation) armed at startup, with `stt.utteranceEndMs` joining segments of one utterance until the speaker pauses
-- Added `stt.confirm` spoken draft replies: “send”/“yes”/“yep” submits, “reset”/“start over” clears, longer speech appends, ambiguous replies go to the judge
+- Added `stt.confirm` spoken draft replies: “send”/“yes”/“yep” submits, “reset”/“start over” clears, “continue” resumes dictating into the draft, longer speech appends, ambiguous replies go to the judge
 - Added opt-in two-stage `stt.correction` review with an independently configurable judge gate and Haiku correction model, automatic configured fallbacks, original-draft preservation on failures or edits, live recognized-text preview, a status summary of corrections, and explicit Send for all processed dictation
 
 ### Fixed
