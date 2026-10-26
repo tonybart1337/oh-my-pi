@@ -120,6 +120,26 @@ function isWireAgentEvent(event: AgentSessionEvent): event is AgentSessionEvent 
 function isWireSessionEntry(entry: StoredSessionEntry): entry is StoredSessionEntry & WireSessionEntry {
 	return entry.type in WIRE_SESSION_ENTRY_TYPES;
 }
+
+/**
+ * Index of the first entry in the newest suffix whose serialized size fits in
+ * `budget` bytes. Always keeps at least the last entry; an entry that does not
+ * serialize ends the suffix (the shrinker handles it if it is the only one).
+ */
+function tailStart(entries: readonly WireSessionEntry[], budget: number): number {
+	let used = 0;
+	for (let i = entries.length - 1; i >= 0; i--) {
+		let size: number;
+		try {
+			size = Buffer.byteLength(JSON.stringify(entries[i]) ?? "", "utf8");
+		} catch {
+			return i === entries.length - 1 ? i : i + 1;
+		}
+		used += size;
+		if (used > budget) return i === entries.length - 1 ? i : i + 1;
+	}
+	return 0;
+}
 const CONNECT_TIMEOUT_MS = 15_000;
 /** Max bytes served per fetch-transcript reply (guest re-requests from `newSize`). */
 export const TRANSCRIPT_READ_CAP = 4 * 1024 * 1024;
@@ -231,7 +251,7 @@ export class CollabHost {
 	 * yet, and after a shed, when the peer leaves the participant list but is
 	 * still owed a resync error.
 	 */
-	#peers = new Map<number, { name: string; canWrite: boolean }>();
+	#peers = new Map<number, { name: string; canWrite: boolean; snapshotTailBytes: number | undefined }>();
 	/**
 	 * Never reset, including across a room recreation: ids must not be reissued, or
 	 * a late `ui-response` carrying an old id would settle an unrelated new request.
@@ -751,7 +771,7 @@ export class CollabHost {
 		if (!this.#guestTrafficAllowed()) return;
 		switch (frame.t) {
 			case "hello":
-				this.#handleHello(frame.name, frame.proto, frame.writeToken, fromPeer);
+				this.#handleHello(frame.name, frame.proto, frame.writeToken, frame.snapshotTailBytes, fromPeer);
 				break;
 			case "prompt":
 				if (this.#rejectWhileStarting("prompting", fromPeer)) break;
@@ -800,7 +820,13 @@ export class CollabHost {
 		return true;
 	}
 
-	#handleHello(name: string, proto: number, writeToken: string | undefined, fromPeer: number): void {
+	#handleHello(
+		name: string,
+		proto: number,
+		writeToken: string | undefined,
+		snapshotTailBytes: unknown,
+		fromPeer: number,
+	): void {
 		if (this.#ctx.session.isSessionTransitioning) {
 			this.#send({ t: "error", message: "Session transition in progress; join again when it completes" }, fromPeer);
 			return;
@@ -814,8 +840,13 @@ export class CollabHost {
 		}
 		const cleanName = name.trim().slice(0, 64) || `guest-${fromPeer}`;
 		const canWrite = this.#verifyWriteToken(writeToken);
-		this.#peers.set(fromPeer, { name: cleanName, canWrite });
-		if (!this.#sendWelcome(fromPeer, canWrite)) return;
+		const tailBytes =
+			typeof snapshotTailBytes === "number" && Number.isFinite(snapshotTailBytes) && snapshotTailBytes > 0
+				? snapshotTailBytes
+				: undefined;
+		const peer = { name: cleanName, canWrite, snapshotTailBytes: tailBytes };
+		this.#peers.set(fromPeer, peer);
+		if (!this.#sendWelcome(fromPeer, peer)) return;
 		this.#ctx.session.emitNotice(
 			"info",
 			`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
@@ -828,20 +859,24 @@ export class CollabHost {
 	/**
 	 * Full state for one peer: welcome, transcript snapshot, and (for writers) every
 	 * pending question. Guests treat a later welcome as a reset, which is what makes
-	 * this the resync path as well as the join path.
+	 * this the resync path as well as the join path. A peer that asked for
+	 * `snapshotTailBytes` gets only the newest entries within that budget.
 	 *
 	 * @returns false when there is no socket to send on.
 	 */
-	#sendWelcome(peerId: number, canWrite: boolean): boolean {
+	#sendWelcome(peerId: number, peer: { canWrite: boolean; snapshotTailBytes: number | undefined }): boolean {
 		const socket = this.#socket;
 		if (!socket) return false;
+		const { canWrite } = peer;
 		// Serialize the snapshot synchronously: live traffic queued after this
 		// cannot overtake it, and host rewrites of an entry in place cannot leak
 		// into it later, so the live entries are read without a defensive deep
 		// copy. Chunk frames are assembled from these strings only as the
 		// transport drains.
 		const snapshot = this.#ctx.sessionManager.snapshotForReplication();
-		const snapshotEntries = this.#serializeSnapshotEntries(snapshot.entries.filter(isWireSessionEntry));
+		const wireEntries = snapshot.entries.filter(isWireSessionEntry);
+		const start = peer.snapshotTailBytes === undefined ? 0 : tailStart(wireEntries, peer.snapshotTailBytes);
+		const snapshotEntries = this.#serializeSnapshotEntries(start === 0 ? wireEntries : wireEntries.slice(start));
 		const state = this.#buildState();
 		// State broadcasts pause while no guest is joined, so the dedupe baseline
 		// may predate this welcome; with no other peer to keep current, the welcome
@@ -856,6 +891,7 @@ export class CollabHost {
 				agents: this.#snapshotAgents(),
 				entryCount: snapshotEntries.json.length,
 				readOnly: canWrite ? undefined : true,
+				historyTruncated: start > 0 ? true : undefined,
 			},
 			peerId,
 		);
@@ -879,7 +915,7 @@ export class CollabHost {
 			await this.#ctx.session.waitForSessionTransition();
 		}
 		if (!this.#guestTrafficAllowed() || this.#peers.size === 0) return;
-		for (const [peerId, peer] of this.#peers) this.#sendWelcome(peerId, peer.canWrite);
+		for (const [peerId, peer] of this.#peers) this.#sendWelcome(peerId, peer);
 		this.#ctx.showStatus(`Collab: resynced ${this.#peers.size} guest(s) after a send backlog overflow`, {
 			dim: true,
 		});
