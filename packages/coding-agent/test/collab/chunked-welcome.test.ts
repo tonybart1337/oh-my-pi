@@ -280,6 +280,53 @@ describe("collab chunked welcome (#3144)", () => {
 		expect(flattened.map(e => e.id)).toEqual(snapshot.entries.map(e => e.id));
 	});
 
+	it("sends only the newest entries within snapshotTailBytes and flags the omission", async () => {
+		const parsed = parseCollabLink(host.link);
+		if ("error" in parsed) throw new Error(parsed.error);
+		const key = await importRoomKey(parsed.key);
+		const socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+		guestCleanups.push(() => socket.close());
+
+		const frames: CollabFrame[] = [];
+		const trainDone = Promise.withResolvers<void>();
+		socket.onFrame = frame => {
+			frames.push(frame);
+			if (frame.t === "snapshot-chunk" && frame.final) trainDone.resolve();
+		};
+		// ~16 KB entries: a 100 KB budget fits six of them, not seven.
+		socket.onOpen = () => socket.send({ t: "hello", proto: COLLAB_PROTO, name: "tail", snapshotTailBytes: 100 * 1024 });
+		socket.connect();
+		await trainDone.promise;
+
+		const welcome = frames.find(f => f.t === "welcome");
+		if (welcome?.t !== "welcome") throw new Error("expected welcome frame");
+		expect(welcome.historyTruncated).toBe(true);
+		const received = frames.flatMap(f => (f.t === "snapshot-chunk" ? f.entries : []));
+		expect(welcome.entryCount).toBe(6);
+		expect(received.map(e => e.id)).toEqual(snapshot.entries.slice(-6).map(e => e.id));
+	});
+
+	it("still sends at least the newest entry when it alone exceeds the budget", async () => {
+		const parsed = parseCollabLink(host.link);
+		if ("error" in parsed) throw new Error(parsed.error);
+		const key = await importRoomKey(parsed.key);
+		const socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+		guestCleanups.push(() => socket.close());
+
+		const frames: CollabFrame[] = [];
+		const trainDone = Promise.withResolvers<void>();
+		socket.onFrame = frame => {
+			frames.push(frame);
+			if (frame.t === "snapshot-chunk" && frame.final) trainDone.resolve();
+		};
+		socket.onOpen = () => socket.send({ t: "hello", proto: COLLAB_PROTO, name: "tiny", snapshotTailBytes: 1 });
+		socket.connect();
+		await trainDone.promise;
+
+		const received = frames.flatMap(f => (f.t === "snapshot-chunk" ? f.entries : []));
+		expect(received.map(e => e.id)).toEqual(snapshot.entries.slice(-1).map(e => e.id));
+	});
+
 	it("rejects the pending join when snapshot resume fails", async () => {
 		const failure = new Error("replica write failed during snapshot resume");
 		const writeSpy = spyOn(Bun, "write").mockRejectedValue(failure);

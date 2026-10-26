@@ -71,6 +71,8 @@ export type CollabFrame =
 			entryCount: number;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
+			/** Only the newest entries were sent, at the guest's `snapshotTailBytes` request. */
+			historyTruncated?: boolean;
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Splits a large
