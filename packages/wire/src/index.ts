@@ -348,6 +348,13 @@ export type GuestFrame =
 			 * read-only and rejects their mutating frames.
 			 */
 			writeToken?: string;
+			/**
+			 * Ask for only the newest entries in the join snapshot, bounded by
+			 * this many serialized bytes (at least one entry is always sent).
+			 * Absent means the full transcript. Guests that page older history
+			 * from elsewhere set it so a long session joins in constant time.
+			 */
+			snapshotTailBytes?: number;
 	  }
 	/** `followUp`: wait for the running turn to finish instead of steering it (the TUI's Ctrl+Enter). */
 	| { t: "prompt"; text: string; images?: ImageContent[]; followUp?: true }
@@ -379,6 +386,11 @@ export type HostFrame =
 			entryCount: number;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
+			/**
+			 * True when the snapshot holds only the newest entries because the
+			 * guest requested `snapshotTailBytes`; earlier entries were omitted.
+			 */
+			historyTruncated?: boolean;
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Hosts split the
