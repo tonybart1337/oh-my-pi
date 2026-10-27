@@ -3106,6 +3106,7 @@ export class InputController {
 			keybindings: this.ctx.keybindings,
 			copyCurrentLine: () => this.handleCopyCurrentLine(),
 			copyPrompt: () => this.handleCopyPrompt(),
+			cutPrompt: () => this.handleCutPrompt(),
 			undo: () => this.ctx.composer.undo(),
 			moveCursorToMessageEnd: () => this.ctx.composer.setCursor(this.ctx.composer.text().length),
 			moveCursorToMessageStart: () => this.ctx.composer.setCursor(0),
@@ -3156,6 +3157,25 @@ export class InputController {
 		} catch {
 			this.ctx.showWarning("Failed to copy to clipboard");
 		}
+	}
+
+	/** Copy current prompt text to system clipboard, then clear the composer. */
+	handleCutPrompt(): void {
+		const text = this.ctx.composer.text();
+		if (!text) {
+			this.ctx.showStatus("Nothing to cut");
+			return;
+		}
+		try {
+			copyToClipboard(text);
+		} catch {
+			this.ctx.showWarning("Failed to copy to clipboard");
+			return;
+		}
+		this.ctx.composer.setText("");
+		const sanitized = sanitizeText(text);
+		const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
+		this.ctx.showStatus(`Cut: ${preview}`);
 	}
 
 	cycleThinkingLevel(): void {
