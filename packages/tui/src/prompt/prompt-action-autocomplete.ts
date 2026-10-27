@@ -56,6 +56,7 @@ interface PromptActionAutocompleteOptions {
 	keybindings: KeybindingsManager;
 	copyCurrentLine: () => void;
 	copyPrompt: () => void;
+	cutPrompt: () => void;
 	undo: (prefix: string) => void;
 	moveCursorToMessageEnd: () => void;
 	moveCursorToMessageStart: () => void;
@@ -311,6 +312,13 @@ export function createPromptActionAutocompleteProvider(
 			description: formatKeyHints(options.keybindings.getKeys("app.clipboard.copyPrompt")),
 			keywords: ["copy", "prompt", "clipboard", "message"],
 			execute: options.copyPrompt,
+		},
+		{
+			id: "cut-prompt",
+			label: "Cut whole prompt",
+			description: "Clear editor into clipboard",
+			keywords: ["cut", "prompt", "clipboard", "message", "clear"],
+			execute: options.cutPrompt,
 		},
 		{
 			id: "undo",

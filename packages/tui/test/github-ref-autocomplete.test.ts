@@ -11,6 +11,7 @@ function makeProvider(commands: SlashCommand[] = []) {
 		keybindings: AppKeybindingsManager.inMemory({}),
 		copyCurrentLine: () => {},
 		copyPrompt: () => {},
+		cutPrompt: () => {},
 		undo: () => {},
 		moveCursorToMessageEnd: () => {},
 		moveCursorToMessageStart: () => {},
