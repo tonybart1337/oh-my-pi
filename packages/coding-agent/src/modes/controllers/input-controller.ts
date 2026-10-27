@@ -2980,6 +2980,7 @@ export class InputController {
 			keybindings: this.ctx.keybindings,
 			copyCurrentLine: () => this.handleCopyCurrentLine(),
 			copyPrompt: () => this.handleCopyPrompt(),
+			cutPrompt: () => this.handleCutPrompt(),
 			undo: prefix => this.ctx.editor.undoPastTransientText(prefix),
 			moveCursorToMessageEnd: () => this.ctx.editor.moveToMessageEnd(),
 			moveCursorToMessageStart: () => this.ctx.editor.moveToMessageStart(),
@@ -3021,6 +3022,26 @@ export class InputController {
 		} catch {
 			this.ctx.showWarning("Failed to copy to clipboard");
 		}
+	}
+
+	/** Copy current prompt text to system clipboard, then clear the editor. */
+	handleCutPrompt(): void {
+		const text = this.ctx.editor.getText();
+		if (!text) {
+			this.ctx.showStatus("Nothing to cut");
+			return;
+		}
+		try {
+			copyToClipboard(text);
+		} catch {
+			this.ctx.showWarning("Failed to copy to clipboard");
+			return;
+		}
+		this.ctx.editor.setText("");
+		this.ctx.ui.requestRender();
+		const sanitized = sanitizeText(text);
+		const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
+		this.ctx.showStatus(`Cut: ${preview}`);
 	}
 
 	cycleThinkingLevel(): void {
