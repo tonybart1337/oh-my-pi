@@ -96,7 +96,9 @@ function normalizeRelativePath(input: string): string {
 		path.posix.isAbsolute(normalized) ||
 		/^[a-zA-Z]:/.test(slashed)
 	) {
-		throw new Error(`Security scope path must be repository-relative: ${input}`);
+		throw new Error(
+			`Security scope path must be repository-relative: ${input}. To scan a different repository or worktree, pass its path as \`repository\`.`,
+		);
 	}
 	return normalized;
 }
