@@ -379,16 +379,14 @@ export async function handleSecurityCommand(
 	}
 	try {
 		const option = splitRepositoryOption(command.args);
-		const repository = resolveSecurityRepository(
-			runtime.cwd,
-			runtime.sessionManager.getAdditionalDirectories(),
-			option.repository,
-		);
+		const repository = resolveSecurityRepository(runtime.cwd, option.repository);
 		const { verb, rest } = parseSubcommand(option.rest);
 		switch (verb || "scans") {
 			case "plan": {
 				const plan = await preflight(runtime, repository, rest);
-				await runtime.output(`Security plan ${plan.id} is ready. Fingerprint: ${plan.fingerprint}.`);
+				await runtime.output(
+					`Security plan ${plan.id} for ${plan.repositoryRoot} is ready. Fingerprint: ${plan.fingerprint}.`,
+				);
 				return commandConsumed();
 			}
 			case "scan": {

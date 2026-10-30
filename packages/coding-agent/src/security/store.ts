@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { getSecurityProjectDir, isEnoent } from "@oh-my-pi/pi-utils";
+import { getSecurityDir, getSecurityProjectDir, isEnoent } from "@oh-my-pi/pi-utils";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { compareSecurityLineage } from "./comparison";
 import type {
@@ -172,6 +172,39 @@ export class SecurityStore {
 		options.signal?.throwIfAborted();
 		const repositoryRoot = vcs.repo(resolvedCwd)?.root() ?? resolvedCwd;
 		return SecurityStore.open(repositoryRoot, options);
+	}
+
+	/**
+	 * Store that holds `scanId`, whichever repository it was scanned from. Scan ids are
+	 * globally unique, so results stay readable after their checkout (e.g. a temporary
+	 * worktree) is gone. Undefined when no store indexes the scan.
+	 */
+	static async openForScan(scanId: string, options: SecurityStoreOptions = {}): Promise<SecurityStore | undefined> {
+		if (!/^secscan_[a-zA-Z0-9]+$/.test(scanId)) throw new Error(`Invalid security scan id: ${scanId}`);
+		const stateRoot = options.stateRoot ? path.resolve(options.stateRoot) : getSecurityDir();
+		let entries: string[];
+		try {
+			entries = await fs.readdir(stateRoot);
+		} catch (error) {
+			if (isEnoent(error)) return undefined;
+			throw error;
+		}
+		for (const entry of entries) {
+			options.signal?.throwIfAborted();
+			const projectDirectory = path.join(stateRoot, entry);
+			const text = await readOptionalText(path.join(projectDirectory, "index.json"));
+			if (text === undefined) continue;
+			const index = JSON.parse(text) as Partial<SecurityStoreIndex>;
+			if (
+				index.schemaVersion === STORE_SCHEMA_VERSION &&
+				index.projectKey === entry &&
+				typeof index.repositoryRoot === "string" &&
+				index.scanIds?.includes(scanId)
+			) {
+				return new SecurityStore(index.repositoryRoot, entry, projectDirectory);
+			}
+		}
+		return undefined;
 	}
 
 	get repositoryRoot(): string {

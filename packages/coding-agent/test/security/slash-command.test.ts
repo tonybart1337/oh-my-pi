@@ -146,25 +146,26 @@ describe("/security", () => {
 		});
 	});
 
-	test("--repo reaches another repository only after /add-dir admitted it", async () => {
+	test("--repo targets any checkout, and its scans stay readable by id after the checkout is gone", async () => {
 		const otherRoot = path.join(temporaryRoot, "other");
 		await fs.mkdir(otherRoot);
-		const importIntoOther = `--repo ${JSON.stringify(otherRoot)} import ${JSON.stringify(SARIF_FIXTURE)}`;
-		await command(importIntoOther);
-		expect(output.at(-1)).toContain("outside this session's workspace");
-		expect(await (await SecurityStore.open(otherRoot)).listScans()).toHaveLength(0);
-
-		await command(importIntoOther, [otherRoot]);
+		await command(`--repo ${JSON.stringify(otherRoot)} import ${JSON.stringify(SARIF_FIXTURE)}`);
 		const [scan] = await (await SecurityStore.open(otherRoot)).listScans();
-		if (!scan) throw new Error("expected scan imported into the added repository");
+		if (!scan) throw new Error("expected scan imported into the other repository");
 		expect(await (await SecurityStore.open(repositoryRoot)).listScans()).toHaveLength(0);
 
-		// security:// finds the scan through the caller's workspace roots, and only through them.
 		const handler = new SecurityProtocolHandler(undefined, () => true);
-		const url = parseInternalUrl(`security://scans/${scan.id}`);
-		const session = { additionalDirectories: [otherRoot] } as ToolSession;
-		expect((await handler.resolve(url, { cwd: repositoryRoot, session })).content).toContain(scan.id);
-		await expect(handler.resolve(url, { cwd: repositoryRoot })).rejects.toThrow("Unknown security scan");
+		await expect(
+			handler.resolve(parseInternalUrl("security://scans"), { cwd: repositoryRoot }),
+		).resolves.toMatchObject({
+			content: expect.not.stringContaining(scan.id),
+		});
+		await fs.rm(otherRoot, { recursive: true });
+		const url = parseInternalUrl(`security://scans/${scan.id}/findings`);
+		expect((await handler.resolve(url, { cwd: repositoryRoot })).content).toContain(`Findings for ${scan.id}`);
+		await expect(
+			handler.resolve(parseInternalUrl("security://scans/secscan_missing"), { cwd: repositoryRoot }),
+		).rejects.toThrow("Unknown security scan");
 	});
 
 	test("disabled command is refused without touching session state", async () => {

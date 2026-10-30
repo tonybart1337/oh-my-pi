@@ -7,7 +7,7 @@
 - `security.enabled` defaults to `false`. When disabled, `security_scan` is omitted from the available tool set and `security://` reads fail with an enablement message. Enable it in **Settings → Tools → Security** or set `security.enabled = true`.
 - The tool is discoverable, strict-schema, and classified as `exec`.
 - Native `preflight` requires a Git repository, an active model, and the session model/authentication registries. It selects a stored OAuth credential when available. Without one, only provider-owned authentication APIs explicitly declared in provider metadata are accepted: Amazon Bedrock (`bedrock-converse-stream`), Bedrock Mantle (`openai-responses`), and extension providers registered with `nativeAuthApis` (see [extensions](../extensions.md)). Ordinary API-key-only providers are not accepted.
-- Native actions target the Git repository of the session's working directory. `repository` selects another one: it must be the working directory or lie inside a workspace directory added with `/add-dir` (or `--add-dir`), otherwise the action fails with `Security repository <path> is outside this session's workspace; add it with /add-dir first`. The `/security` command takes the same choice as a leading `--repo <path>`.
+- Native actions target the Git repository of the session's working directory. `repository` selects any other checkout instead (another repository, or a temporary worktree created for the scan); the `/security` command takes the same choice as a leading `--repo <path>`. Approval of the `exec`-tier tool is the consent boundary.
 - If several OAuth accounts exist and none is active, pass `credential_id`; a lone account is selected automatically. The immutable plan pins the credential row and recorded account/workspace identity. Execution and token refresh stay on that row rather than rotating to another account.
 - Cloud actions call ChatGPT's Codex Security cloud control plane, not the public OpenAI API, and are never a fallback from a native scan. They authenticate with a stored `openai-codex` ChatGPT OAuth credential; without one, they use the provider route a proxy extension registered with `codexSecurityCloud` (see [extensions](../extensions.md)). With several routes registered, `cloud_provider` must name one; `credential_id` applies only to OAuth.
 
@@ -28,7 +28,7 @@
 | Field                    | Type                                                                                                                               | Used by                                | Description                                                                                                                                                                                                 |
 | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `action`                 | `"preflight" \| "start" \| "status" \| "cancel" \| "validate" \| "cloud_scans" \| "cloud_start" \| "cloud_status" \| "cloud_pull"` | All                                    | Required dispatch selector.                                                                                                                                                                                 |
-| `repository`             | `string`                                                                                                                           | Native actions, `validate`, `cloud_pull` | Repository to operate on; defaults to the working directory. Must be inside a session workspace root. Pass the same value to every action on that repository's plans and scans.                           |
+| `repository`             | `string`                                                                                                                           | Native actions, `validate`, `cloud_pull` | Git checkout to operate on, absolute or relative to the working directory; defaults to the working directory. Pass the same value to every action on that repository's plans and scans.                    |
 | `plan_id`                | `string`                                                                                                                           | `start`                                | Plan ID returned by `preflight`.                                                                                                                                                                            |
 | `operation_id`           | `string`                                                                                                                           | `status`, `cancel`                     | Operation ID returned by `start`.                                                                                                                                                                           |
 | `target_kind`            | `"repository" \| "scoped_path" \| "ref_diff" \| "working_tree"`                                                                    | `preflight`                            | Defaults to `repository`.                                                                                                                                                                                   |
@@ -65,7 +65,7 @@ Every action returns one text content block plus structured `details` containing
 `preflight` resolves and persists an immutable plan, then returns:
 
 ```text
-Security plan <plan-id> is ready. Fingerprint: <fingerprint>. Start it with action=start and plan_id=<plan-id>.
+Security plan <plan-id> for <repository-root> is ready. Fingerprint: <fingerprint>. Start it with action=start plan_id=<plan-id>.
 ```
 
 `details` is `{ action: "preflight", plan: { id, fingerprint } }`.
@@ -184,7 +184,7 @@ Directories are hardened to mode `0700` and files to `0600` on non-Windows platf
 
 ## Reading results
 
-The `security://` namespace is read-only and workspace-scoped: it lists and resolves scans from the stores of the working directory's repository and of every `/add-dir` workspace directory. Reads reflect the current stored state:
+The `security://` namespace is read-only. `security://scans` lists the scans stored for the working directory's repository and every `/add-dir` workspace directory; `security://scans/<scan-id>` and its children resolve a scan from any repository's store, so results stay readable after a temporary worktree is removed. Reads reflect the current stored state:
 
 | URL                                                | Result                                                  |
 | -------------------------------------------------- | ------------------------------------------------------- |
