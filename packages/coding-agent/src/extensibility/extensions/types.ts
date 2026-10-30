@@ -97,11 +97,7 @@ import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { LoopLimitConfig } from "../../modes/loop-limit";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
-import type {
-	AsyncJobInspection,
-	EphemeralTurnOptions,
-	EphemeralTurnResult,
-} from "../../session/agent-session-types";
+import type { AsyncJobInspection, EphemeralTurnOptions, EphemeralTurnResult } from "../../session/agent-session-types";
 import type { CompactMode } from "../../session/compact-modes";
 import type { CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
@@ -2386,6 +2382,12 @@ export interface ProviderConfig extends Pick<
 	headers?: Record<string, string>;
 	/** If true, adds Authorization: Bearer header with the resolved API key. */
 	authHeader?: boolean;
+	/**
+	 * APIs whose transport resolves the real credential without a stored account, e.g. a proxy
+	 * that swaps a stub `apiKey` for its own. Security scans accept these models without a
+	 * `/login` OAuth row and authenticate through this provider's normal key resolution.
+	 */
+	nativeAuthApis?: Api[];
 	/** Models to register. If provided, replaces all existing models for this provider. */
 	models?: ProviderModelConfig[];
 	/** Optional normalized usage fetcher used by AuthStorage for this provider. */

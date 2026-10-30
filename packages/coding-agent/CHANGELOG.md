@@ -51,6 +51,7 @@
 - Added `stt.alwaysOn` continuous listening (wake phrase or open-microphone dictation) armed at startup, with `stt.utteranceEndMs` joining segments of one utterance until the speaker pauses
 - Added `stt.confirm` spoken draft replies: “send”/“yes”/“yep” submits, “reset”/“start over” clears, “continue” resumes dictating into the draft, longer speech appends, ambiguous replies go to the judge
 - `#` prompt action "Cut whole prompt": copies the prompt to the clipboard and clears the composer
+- Extension providers can declare `nativeAuthApis` in `registerProvider`, so proxies that inject their own credential can run native security scans without a stored OAuth account.
 
 ### Fixed
 
