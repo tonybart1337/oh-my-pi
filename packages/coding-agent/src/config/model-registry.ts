@@ -85,6 +85,7 @@ import { getAgentDir, isBunTestRuntime, logger, wrapFetchForExtraCa } from "@oh-
 import { groupModelCandidates, resolveProviderModelReference } from "../config/model-resolver";
 import { generateCodexAttestation } from "../live/attestation";
 import type { AuthStorage } from "../session/auth-storage";
+import type { CodexSecurityCloudRoute } from "../security/cloud";
 import { redactUrlForLog } from "../utils/redact-url";
 import { END_SLICE, runSlicedWork } from "../utils/sliced-work";
 import type { SearchParams } from "../web/search/providers/base";
@@ -609,6 +610,9 @@ export class ModelRegistry {
 	// `registerProvider({ nativeAuthApis })`: APIs whose transport owns the
 	// credential (no stored account), e.g. a proxy that injects the real key.
 	#runtimeNativeAuthApis: Map<string, readonly Api[]> = new Map();
+	// `registerProvider({ codexSecurityCloud })`: Codex Security cloud routes
+	// whose proxy injects the ChatGPT credential.
+	#runtimeCodexSecurityCloudRoutes: Map<string, CodexSecurityCloudRoute> = new Map();
 	// Command-backed values from registerProvider (apiKey + provider/model
 	// headers). Separate from #commandConfigsByProvider because static reload
 	// rebuilds that map from models.yml only; runtime entries must survive.
@@ -4802,9 +4806,15 @@ export class ModelRegistry {
 		return this.#runtimeNativeAuthApis.get(provider) ?? getProviderDefinition(provider)?.nativeAuthApis;
 	}
 
+	/** Extension providers that reach Codex Security cloud through their own credential-injecting proxy. */
+	codexSecurityCloudRoutes(): ReadonlyMap<string, CodexSecurityCloudRoute> {
+		return this.#runtimeCodexSecurityCloudRoutes;
+	}
+
 	#clearRuntimeProviderState(providerName: string): void {
 		this.#runtimeProviderApiKeys.delete(providerName);
 		this.#runtimeNativeAuthApis.delete(providerName);
+		this.#runtimeCodexSecurityCloudRoutes.delete(providerName);
 		this.#runtimeProviderOverrides.delete(providerName);
 		this.#runtimeCommandConfigsByProvider.delete(providerName);
 		this.#runtimeModelOverlays = this.#runtimeModelOverlays.filter(overlay => overlay.provider !== providerName);
@@ -5043,6 +5053,8 @@ export class ModelRegistry {
 		this.#recordRuntimeCommandConfigs(providerName, config);
 		if (config.nativeAuthApis?.length) this.#runtimeNativeAuthApis.set(providerName, config.nativeAuthApis);
 		else this.#runtimeNativeAuthApis.delete(providerName);
+		if (config.codexSecurityCloud) this.#runtimeCodexSecurityCloudRoutes.set(providerName, config.codexSecurityCloud);
+		else this.#runtimeCodexSecurityCloudRoutes.delete(providerName);
 
 		if (config.models && config.models.length > 0) {
 			// Build model overlays that persist across refresh() cycles
@@ -5425,6 +5437,8 @@ export interface ProviderConfigInput {
 	rules?: Readonly<Record<string, unknown>>;
 	/** APIs whose transport resolves credentials without a stored account (see the extension `ProviderConfig`). */
 	nativeAuthApis?: Api[];
+	/** Codex Security cloud route (see the extension `ProviderConfig`). */
+	codexSecurityCloud?: CodexSecurityCloudRoute;
 	oauth?: {
 		name: string;
 		login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials | string>;
