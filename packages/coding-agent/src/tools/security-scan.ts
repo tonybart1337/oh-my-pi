@@ -13,6 +13,7 @@ import type { SecurityOperationSnapshot } from "../security/coordinator";
 import { getSecurityCoordinator } from "../security/coordinator";
 import type { SecurityTargetRequest } from "../security/preflight";
 import { SecurityStore } from "../security/store";
+import { resolveSecurityRepository } from "../security/workspace";
 import type { ToolSession } from "./index";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
@@ -21,6 +22,7 @@ import { cfgSecurityEnabled } from "./settings";
 const securityScanSchema = type({
 	action:
 		"'preflight' | 'start' | 'status' | 'cancel' | 'validate' | 'cloud_scans' | 'cloud_start' | 'cloud_status' | 'cloud_pull'",
+	"repository?": "string",
 	"plan_id?": "string",
 	"operation_id?": "string",
 	"target_kind?": "'repository' | 'scoped_path' | 'ref_diff' | 'working_tree'",
@@ -124,12 +126,23 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 		if (!cfgSecurityEnabled.get(this.session.settings)) {
 			throw new ToolError("Security is disabled. Enable security.enabled before using security_scan.");
 		}
+		let repository: string;
+		try {
+			repository = resolveSecurityRepository(
+				this.session.cwd,
+				this.session.additionalDirectories,
+				params.repository,
+			);
+		} catch (error) {
+			throw new ToolError(error instanceof Error ? error.message : String(error));
+		}
+		const repositoryArg = params.repository?.trim() ? ` repository=${repository}` : "";
 		const coordinatorForSession = () => {
 			if (!this.session.modelRegistry || !this.session.authStorage) {
 				throw new ToolError("Security scan requires the session model and authentication registries");
 			}
 			return getSecurityCoordinator({
-				cwd: this.session.cwd,
+				cwd: repository,
 				settings: this.session.settings,
 				authStorage: this.session.authStorage,
 				modelRegistry: this.session.modelRegistry,
@@ -155,7 +168,7 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 					[
 						`Security plan ${plan.id} is ready.`,
 						`Fingerprint: ${plan.fingerprint}.`,
-						`Start it with action=start and plan_id=${plan.id}.`,
+						`Start it with action=start${repositoryArg} plan_id=${plan.id}.`,
 					].join(" "),
 					{ action: params.action, plan: { id: plan.id, fingerprint: plan.fingerprint } },
 				);
@@ -164,10 +177,13 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 				const operation = await coordinatorForSession().start({
 					planId: requireValue(params.plan_id, "plan_id"),
 				});
-				return textResult(`Security scan ${operation.scanId} started as ${operation.operationId}.`, {
-					action: params.action,
-					operation,
-				});
+				return textResult(
+					`Security scan ${operation.scanId} started as ${operation.operationId}${repositoryArg}.`,
+					{
+						action: params.action,
+						operation,
+					},
+				);
 			}
 			case "status": {
 				const operationId = requireValue(params.operation_id, "operation_id");
@@ -234,7 +250,7 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 				);
 			}
 			case "cloud_pull": {
-				const store = await SecurityStore.openForCwd(this.session.cwd, { signal });
+				const store = await SecurityStore.openForCwd(repository, { signal });
 				const bundle = await pullCodexSecurityCloudResults({
 					client: cloudClientForSession(this.session, params.credential_id),
 					configurationId: requireValue(params.cloud_configuration_id, "cloud_configuration_id"),
@@ -255,7 +271,7 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 				const status = params.validation_status;
 				if (!status) throw new ToolError("validation_status is required for this action");
 				const summary = requireValue(params.validation_summary, "validation_summary");
-				const store = await SecurityStore.openForCwd(this.session.cwd, { signal });
+				const store = await SecurityStore.openForCwd(repository, { signal });
 				const finding = await store.getFinding(scanId, findingId);
 				if (!finding) throw new ToolError(`Unknown security finding: ${findingId}`);
 				const evidence: SecurityEvidence[] = (params.validation_evidence ?? []).map((item, index) => ({
