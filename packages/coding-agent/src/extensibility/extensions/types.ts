@@ -94,6 +94,7 @@ import type { NativeToolView } from "@oh-my-pi/pi-tui/tools/renderer";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
 import type { AsyncJobInspection, EphemeralTurnOptions, EphemeralTurnResult } from "../../session/agent-session-types";
 import type { CompactMode } from "../../session/compact-modes";
+import type { CodexSecurityCloudRoute } from "../../security/cloud";
 import type { CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
 import type { BashToolInput, GlobToolInput, GrepToolInput, ReadToolInput, WriteToolInput } from "../../tools";
@@ -2192,6 +2193,12 @@ export interface ProviderConfig {
 	 * `/login` OAuth row and authenticate through this provider's normal key resolution.
 	 */
 	nativeAuthApis?: Api[];
+	/**
+	 * Route to ChatGPT's Codex Security cloud API through this provider's proxy, which injects the
+	 * ChatGPT credential and account header. Cloud security actions use it when no `openai-codex`
+	 * OAuth account is stored; requests carry this provider's resolved `apiKey` as the bearer.
+	 */
+	codexSecurityCloud?: CodexSecurityCloudRoute;
 	/** Models to register. If provided, replaces all existing models for this provider. */
 	models?: ProviderModelConfig[];
 	/** Optional normalized usage fetcher used by AuthStorage for this provider. */

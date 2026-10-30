@@ -219,6 +219,8 @@ A provider's `apiKey` (a literal key or an environment variable name) normally o
 
 Native security scans pin either one stored OAuth account or a provider-owned auth route. A proxy provider whose transport injects the real credential (its `apiKey` is a stub) can declare that with `nativeAuthApis: ["anthropic-messages"]` (the APIs it serves): its models then plan and run scans without a `/login` row, authenticating through the provider's normal key resolution. Re-registering without the field, or unregistering, revokes it.
 
+A proxy that can also reach ChatGPT's Codex Security cloud API declares `codexSecurityCloud: { baseUrl, ownerId }`: `baseUrl` reaches `chatgpt.com/backend-api/aardvark` with the proxy injecting the ChatGPT credential and `ChatGPT-Account-Id`, and `ownerId(signal)` returns the injected credential's JWT `sub`, which owns the scan configurations it creates. Cloud security actions send the provider's resolved `apiKey` as the bearer and use the route when no `openai-codex` OAuth account is stored (`cloud_provider` / `/security cloud --provider` picks among several).
+
 Provider login callbacks can request masked entry with
 `callbacks.onPrompt({ message: "Consumer key", secret: true })`. Native `/login`
 and first-run setup preserve the exact submitted value while hiding it in the
