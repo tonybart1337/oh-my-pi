@@ -108,6 +108,10 @@ export interface SecurityScanSession {
 		options?: { expandPromptTemplates?: boolean; synthetic?: boolean; userInitiated?: boolean },
 	): Promise<boolean>;
 	waitForIdle(): Promise<void>;
+	/** True while owned background work (e.g. `security-reviewer` tasks) can still re-wake the session. */
+	hasPendingAsyncWork(): boolean;
+	/** Wait for one generation of owned background work and the follow-up turn its results start. */
+	settleAsyncWork(): Promise<void>;
 	getSessionStats?(): {
 		tokens: {
 			input: number;
@@ -646,6 +650,16 @@ export class SecurityCoordinator {
 					userInitiated: false,
 				});
 				await session.waitForIdle();
+				// The lead hands review slices to background `security-reviewer` tasks and ends its
+				// turn; their results re-wake it to merge and publish. The scan is over only once that
+				// owned work has settled, not when the first turn goes idle.
+				const aborted = Promise.withResolvers<void>();
+				signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+				while (!publishedBundle && !signal.aborted && session.hasPendingAsyncWork()) {
+					const settled = session.settleAsyncWork();
+					await Promise.race([settled, aborted.promise]);
+					if (signal.aborted) void settled.catch(() => undefined);
+				}
 				record.snapshot.sessionFile = session.sessionFile;
 				if (publishedBundle) {
 					const stats = session.getSessionStats?.();
