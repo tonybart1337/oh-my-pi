@@ -52,6 +52,7 @@
 - Added `stt.confirm` spoken draft replies: “send”/“yes”/“yep” submits, “reset”/“start over” clears, “continue” resumes dictating into the draft, longer speech appends, ambiguous replies go to the judge
 - `#` prompt action "Cut whole prompt": copies the prompt to the clipboard and clears the composer
 - Extension providers can declare `nativeAuthApis` in `registerProvider`, so proxies that inject their own credential can run native security scans without a stored OAuth account.
+- Security scans can target any repository in the session workspace: `security_scan` takes `repository` and `/security` a leading `--repo <path>`, accepted for the working directory or an `/add-dir` workspace directory. `security://` lists and resolves scans across those workspace roots.
 
 ### Fixed
 
