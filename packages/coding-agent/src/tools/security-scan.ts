@@ -135,11 +135,7 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 		}
 		let repository: string;
 		try {
-			repository = resolveSecurityRepository(
-				this.session.cwd,
-				this.session.additionalDirectories,
-				params.repository,
-			);
+			repository = resolveSecurityRepository(this.session.cwd, params.repository);
 		} catch (error) {
 			throw new ToolError(error instanceof Error ? error.message : String(error));
 		}
@@ -173,7 +169,7 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 				});
 				return textResult(
 					[
-						`Security plan ${plan.id} is ready.`,
+						`Security plan ${plan.id} for ${plan.repositoryRoot} is ready.`,
 						`Fingerprint: ${plan.fingerprint}.`,
 						`Start it with action=start${repositoryArg} plan_id=${plan.id}.`,
 					].join(" "),
