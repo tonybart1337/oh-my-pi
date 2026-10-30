@@ -2,7 +2,7 @@ import type { AgentOptions } from "@oh-my-pi/pi-agent-core";
 import type { OAuthAccessResolution, OAuthRefreshReason } from "@oh-my-pi/pi-ai";
 import type { ApiKeyResolver } from "@oh-my-pi/pi-ai/auth-retry";
 import * as AIError from "@oh-my-pi/pi-ai/error";
-import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
+import type { ModelRegistry } from "../config/model-registry";
 import type { AuthStorage } from "../session/auth-storage";
 import type { SecurityAccountRef, SecurityAuthRef } from "./contracts";
 
@@ -18,9 +18,13 @@ export interface SecurityAuthModel {
 	api: string;
 }
 
+/** Provider-owned auth lookup; the model registry folds in extension-registered providers. */
+export type SecurityNativeAuthApis = Pick<ModelRegistry, "nativeAuthApis">;
+
 /** Inputs required to enforce a scan authentication reference at request time. */
 export interface SecurityAuthResolverOptions {
 	authStorage: AuthStorage;
+	nativeAuthApis: SecurityNativeAuthApis;
 	auth: SecurityAuthRef;
 	providerResolver: NonNullable<AgentOptions["getApiKey"]>;
 }
@@ -29,8 +33,8 @@ function isOAuthAccount(auth: SecurityAuthRef): auth is SecurityAccountRef {
 	return "credentialId" in auth;
 }
 
-function supportsProviderAuth(model: SecurityAuthModel): boolean {
-	return getProviderDefinition(model.provider)?.nativeAuthApis?.includes(model.api) ?? false;
+function supportsProviderAuth(registry: SecurityNativeAuthApis, model: SecurityAuthModel): boolean {
+	return registry.nativeAuthApis(model.provider)?.includes(model.api) ?? false;
 }
 
 /** Rejects changes to any durable OAuth identity field captured by preflight. */
@@ -100,15 +104,15 @@ export function selectSecurityOAuthAccount(
 /** Selects either one exact OAuth row or an explicitly supported provider-owned auth route. */
 export function selectSecurityAuth(
 	authStorage: AuthStorage,
+	registry: SecurityNativeAuthApis,
 	model: SecurityAuthModel,
 	requestedCredentialId?: number,
 	sessionId?: string,
 ): SecurityAuthRef {
 	const account = selectOAuthAccount(authStorage, model.provider, requestedCredentialId, sessionId);
 	if (account) return account;
-	if (supportsProviderAuth(model)) return { provider: model.provider, api: model.api };
-	const nativeApis = getProviderDefinition(model.provider)?.nativeAuthApis;
-	if (nativeApis) {
+	if (supportsProviderAuth(registry, model)) return { provider: model.provider, api: model.api };
+	if (registry.nativeAuthApis(model.provider)) {
 		throw new Error(`Security scans do not support provider authentication for ${model.provider}/${model.api}`);
 	}
 	throw new Error(`Security scans require a stored OAuth account for ${model.provider}`);
@@ -167,7 +171,7 @@ export function createExactSecurityOAuthResolver(
 export function createSecurityAuthResolver(
 	options: SecurityAuthResolverOptions,
 ): NonNullable<AgentOptions["getApiKey"]> {
-	const { auth, authStorage, providerResolver } = options;
+	const { auth, authStorage, nativeAuthApis, providerResolver } = options;
 	if (isOAuthAccount(auth)) return createExactSecurityOAuthResolver({ authStorage, account: auth });
 	return model => {
 		if (model.provider !== auth.provider) {
@@ -176,7 +180,7 @@ export function createSecurityAuthResolver(
 		if (model.api !== auth.api) {
 			throw new Error("Security scan authentication API mismatch");
 		}
-		if (!supportsProviderAuth(model)) {
+		if (!supportsProviderAuth(nativeAuthApis, model)) {
 			throw new Error(`Security scans do not support provider authentication for ${model.provider}/${model.api}`);
 		}
 		return providerResolver(model);

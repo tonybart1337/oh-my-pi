@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -9,6 +9,7 @@ import { registerOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { createBrokerAuthStorage } from "../../src/cli/auth-broker-cli";
+import { ModelRegistry } from "../../src/config/model-registry";
 import { createExactSecurityOAuthResolver, createSecurityAuthResolver, selectSecurityAuth } from "../../src/security";
 import { AuthStorage, SqliteAuthCredentialStore } from "../../src/session/auth-storage";
 
@@ -19,6 +20,19 @@ function model() {
 }
 
 describe("exact security OAuth resolver", () => {
+	let tmpDir: string;
+	let registryAuth: AuthStorage;
+	let registry: ModelRegistry;
+	beforeAll(async () => {
+		tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-security-auth-"));
+		registryAuth = await AuthStorage.create(":memory:");
+		registry = new ModelRegistry(registryAuth, path.join(tmpDir, "models.yaml"));
+	});
+	afterAll(async () => {
+		registryAuth.close();
+		await removeWithRetries(tmpDir);
+	});
+
 	test("selects an explicit credential without account rotation", () => {
 		const listOAuthAccounts = vi.fn(() => [
 			{ credentialId: 11, position: 0, active: true, accountId: "workspace-a" },
@@ -26,6 +40,7 @@ describe("exact security OAuth resolver", () => {
 		]);
 		const selected = selectSecurityAuth(
 			{ oauth: { accounts: listOAuthAccounts } } as unknown as AuthStorage,
+			registry,
 			model(),
 			42,
 			"session-a",
@@ -42,18 +57,49 @@ describe("exact security OAuth resolver", () => {
 		] as const) {
 			const bedrockModel = getBundledModel(provider, modelId);
 			if (!bedrockModel) throw new Error(`Expected bundled model ${provider}/${modelId}`);
-			expect(selectSecurityAuth(authStorage, bedrockModel)).toEqual({ provider, api });
+			expect(selectSecurityAuth(authStorage, registry, bedrockModel)).toEqual({ provider, api });
 		}
 	});
 
 	test("rejects unsupported provider-owned authentication routes", () => {
 		const authStorage = { oauth: { accounts: vi.fn(() => []) } } as unknown as AuthStorage;
-		expect(() => selectSecurityAuth(authStorage, { provider: "openai", api: "openai-responses" })).toThrow(
+		expect(() => selectSecurityAuth(authStorage, registry, { provider: "openai", api: "openai-responses" })).toThrow(
 			"require a stored OAuth account",
 		);
-		expect(() => selectSecurityAuth(authStorage, { provider: "amazon-bedrock", api: "openai-responses" })).toThrow(
+		expect(() =>
+			selectSecurityAuth(authStorage, registry, { provider: "amazon-bedrock", api: "openai-responses" }),
+		).toThrow("do not support provider authentication");
+	});
+
+	test("extension providers opt into provider-owned authentication for declared APIs only", () => {
+		const authStorage = { oauth: { accounts: vi.fn(() => []) } } as unknown as AuthStorage;
+		const proxy = { provider: "proxy-test", api: "anthropic-messages" } as const;
+		const register = (nativeAuthApis?: ["anthropic-messages"]) =>
+			registry.registerProvider(
+				proxy.provider,
+				{ baseUrl: "http://127.0.0.1:1/t/p", apiKey: "stub", api: proxy.api, nativeAuthApis },
+				"proxy-extension",
+			);
+		register(["anthropic-messages"]);
+		expect(selectSecurityAuth(authStorage, registry, proxy)).toEqual(proxy);
+		expect(() => selectSecurityAuth(authStorage, registry, { ...proxy, api: "openai-responses" })).toThrow(
 			"do not support provider authentication",
 		);
+		const providerResolver = vi.fn(() => "proxied");
+		const resolver = createSecurityAuthResolver({
+			authStorage,
+			nativeAuthApis: registry,
+			auth: proxy,
+			providerResolver,
+		});
+		expect(resolver({ ...model(), ...proxy })).toBe("proxied");
+		// Re-registering without the declaration revokes it, as does unregistering.
+		register();
+		expect(() => selectSecurityAuth(authStorage, registry, proxy)).toThrow("require a stored OAuth account");
+		expect(() => resolver({ ...model(), ...proxy })).toThrow("do not support provider authentication");
+		register(["anthropic-messages"]);
+		registry.unregisterProvider(proxy.provider);
+		expect(() => selectSecurityAuth(authStorage, registry, proxy)).toThrow("require a stored OAuth account");
 	});
 
 	test("provider-owned resolver stays within the pinned provider and API", () => {
@@ -63,6 +109,7 @@ describe("exact security OAuth resolver", () => {
 		const providerResolver = vi.fn(() => "provider-owned");
 		const resolver = createSecurityAuthResolver({
 			authStorage: {} as unknown as AuthStorage,
+			nativeAuthApis: registry,
 			auth: { provider: bedrockModel.provider, api: bedrockModel.api },
 			providerResolver,
 		});
