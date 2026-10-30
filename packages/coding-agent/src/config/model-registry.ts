@@ -407,6 +407,9 @@ export class ModelRegistry {
 	// `fallback` ranks the key below stored login credentials (see registerProvider).
 	#runtimeProviderApiKeys: Map<string, { keyConfig: string; fallback: boolean }> = new Map();
 	#runtimeProviderOverrides: Map<string, ProviderOverride> = new Map();
+	// `registerProvider({ nativeAuthApis })`: APIs whose transport owns the
+	// credential (no stored account), e.g. a proxy that injects the real key.
+	#runtimeNativeAuthApis: Map<string, readonly Api[]> = new Map();
 	// Command-backed values from registerProvider (apiKey + provider/model
 	// headers). Separate from #commandConfigsByProvider because static reload
 	// rebuilds that map from models.yml only; runtime entries must survive.
@@ -3841,8 +3844,17 @@ export class ModelRegistry {
 		return this.authStorage.credentials.hasSubscription(model.provider);
 	}
 
+	/**
+	 * APIs whose transport resolves credentials without a stored account: the
+	 * extension registration's declaration, else the built-in provider definition's.
+	 */
+	nativeAuthApis(provider: string): readonly string[] | undefined {
+		return this.#runtimeNativeAuthApis.get(provider) ?? getProviderDefinition(provider)?.nativeAuthApis;
+	}
+
 	#clearRuntimeProviderState(providerName: string): void {
 		this.#runtimeProviderApiKeys.delete(providerName);
+		this.#runtimeNativeAuthApis.delete(providerName);
 		this.#runtimeProviderOverrides.delete(providerName);
 		this.#runtimeCommandConfigsByProvider.delete(providerName);
 		this.#runtimeModelOverlays = this.#runtimeModelOverlays.filter(overlay => overlay.provider !== providerName);
@@ -4063,6 +4075,8 @@ export class ModelRegistry {
 			this.#runtimeProviderApiKeys.set(providerName, { keyConfig: config.apiKey, fallback });
 		}
 		this.#recordRuntimeCommandConfigs(providerName, config);
+		if (config.nativeAuthApis?.length) this.#runtimeNativeAuthApis.set(providerName, config.nativeAuthApis);
+		else this.#runtimeNativeAuthApis.delete(providerName);
 
 		if (config.models && config.models.length > 0) {
 			// Build model overlays that persist across refresh() cycles
@@ -4414,6 +4428,8 @@ export interface ProviderConfigInput {
 	transport?: Model<Api>["transport"];
 	/** Optional normalized usage fetcher; takes precedence over built-in usage providers. */
 	usage?: UsageProvider;
+	/** APIs whose transport resolves credentials without a stored account (see the extension `ProviderConfig`). */
+	nativeAuthApis?: Api[];
 	oauth?: {
 		name: string;
 		login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials | string>;
