@@ -3,14 +3,16 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $ } from "bun";
+import { ModelRegistry } from "../../src/config/model-registry";
 import type { CodexSecurityCloudFetch } from "../../src/security";
 import {
 	CodexSecurityCloudClient,
 	CodexSecurityCloudHttpError,
+	createCodexSecurityCloudClient,
 	pullCodexSecurityCloudResults,
 	SecurityStore,
 } from "../../src/security";
-import type { AuthStorage } from "../../src/session/auth-storage";
+import { AuthStorage } from "../../src/session/auth-storage";
 
 const ACCOUNT = { provider: "openai-codex", credentialId: 42, accountId: "workspace-a" } as const;
 
@@ -363,5 +365,104 @@ describe("Codex Security cloud client", () => {
 		expect(caught).toBeInstanceOf(CodexSecurityCloudHttpError);
 		if (!(caught instanceof Error)) throw new Error("expected cloud HTTP error");
 		expect(caught.message).not.toContain("secret backend detail");
+	});
+
+	test("a provider route leaves credentials to its proxy and takes the owner from the route", async () => {
+		const requests: Array<{ url: string; authorization: string | null; accountId: string | null; body?: unknown }> =
+			[];
+		let status = 401;
+		const client = new CodexSecurityCloudClient({
+			provider: "proxy",
+			route: { baseUrl: "http://proxy.test/t/p:c/backend-api/aardvark/", ownerId: async () => "google-oauth2|7" },
+			apiKey: async () => "proxy-stub",
+			fetch: async (input, init) => {
+				const headers = new Headers(init?.headers);
+				requests.push({
+					url: String(input),
+					authorization: headers.get("Authorization"),
+					accountId: headers.get("ChatGPT-Account-Id"),
+					body: init?.body ? JSON.parse(String(init.body)) : undefined,
+				});
+				return status === 200 ? json(configuration()) : json({}, status);
+			},
+		});
+
+		// The proxy owns refresh: a 401 is reported, not retried with another token.
+		await expect(client.listConfigurations()).rejects.toBeInstanceOf(CodexSecurityCloudHttpError);
+		expect(requests).toHaveLength(1);
+		status = 200;
+		await client.startScan({
+			repositoryId: "repo-a",
+			repositoryUrl: "https://github.com/a/b",
+			environmentId: "env-a",
+		});
+		expect(requests[1]).toMatchObject({
+			url: "http://proxy.test/t/p:c/backend-api/aardvark/scan_configurations",
+			authorization: "Bearer proxy-stub",
+			accountId: null,
+			body: { scan_input: { owner_id: "google-oauth2|7" } },
+		});
+	});
+
+	test("cloud selection prefers a stored OAuth account, then the sole route, and never guesses among routes", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-cloud-routes-"));
+		const registryAuth = await AuthStorage.create(":memory:");
+		try {
+			const registry = new ModelRegistry(registryAuth, path.join(stateDir, "models.yaml"));
+			const register = (name: string, withRoute: boolean) =>
+				registry.registerProvider(
+					name,
+					{
+						apiKey: `${name}-stub`,
+						...(withRoute
+							? { codexSecurityCloud: { baseUrl: `http://${name}.test/aardvark`, ownerId: async () => name } }
+							: {}),
+					},
+					"cloud-test",
+				);
+			const seen: string[] = [];
+			const fetchMock: CodexSecurityCloudFetch = async (input, init) => {
+				seen.push(`${new URL(String(input)).host} ${new Headers(init?.headers).get("Authorization")}`);
+				return json({ items: [] });
+			};
+			const withAccounts = (accounts: unknown[]) =>
+				({
+					...authStorage(),
+					oauth: { ...authStorage().oauth, accounts: () => accounts },
+				}) as unknown as AuthStorage;
+			const noOAuth = withAccounts([]);
+			const list = (storage: AuthStorage, options: { provider?: string; credentialId?: number } = {}) =>
+				createCodexSecurityCloudClient({
+					authStorage: storage,
+					registry,
+					fetch: fetchMock,
+					...options,
+				}).listConfigurations();
+
+			register("proxy-a", true);
+			await list(noOAuth);
+			await list(withAccounts([{ credentialId: 42, position: 0, active: true, accountId: "workspace-a" }]));
+			expect(seen).toEqual(["proxy-a.test Bearer proxy-a-stub", `chatgpt.com Bearer ${jwt()}`]);
+
+			register("proxy-b", true);
+			expect(() => createCodexSecurityCloudClient({ authStorage: noOAuth, registry })).toThrow(
+				"choose one with cloud_provider",
+			);
+			await list(noOAuth, { provider: "proxy-b" });
+			expect(seen.at(-1)).toBe("proxy-b.test Bearer proxy-b-stub");
+			expect(() =>
+				createCodexSecurityCloudClient({ authStorage: noOAuth, registry, provider: "proxy-b", credentialId: 42 }),
+			).toThrow("cannot select a provider route");
+
+			// Re-registering without the route, or unregistering, withdraws it.
+			register("proxy-b", false);
+			registry.unregisterProvider("proxy-a");
+			expect(() => createCodexSecurityCloudClient({ authStorage: noOAuth, registry })).toThrow(
+				"require a stored OAuth account for openai-codex",
+			);
+		} finally {
+			registryAuth.close();
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
 	});
 });

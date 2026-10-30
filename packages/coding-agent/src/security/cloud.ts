@@ -1,7 +1,9 @@
+import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
 import { decodeJwt } from "@oh-my-pi/pi-ai/registry/oauth/openai-codex";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
+import type { ModelRegistry } from "../config/model-registry";
 import type { AuthStorage } from "../session/auth-storage";
-import { resolveExactSecurityOAuthAccess } from "./auth";
+import { findSecurityOAuthAccount, resolveExactSecurityOAuthAccess } from "./auth";
 import {
 	createSecurityEvidenceId,
 	createSecurityFindingFingerprint,
@@ -39,12 +41,36 @@ type JsonObject = Record<string, unknown>;
 
 export type CodexSecurityCloudFetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
-export interface CodexSecurityCloudClientOptions {
+/**
+ * Provider-owned route to the Codex Security cloud API: a proxy that injects the
+ * ChatGPT credential and account header itself. Extensions register one with
+ * `registerProvider({ codexSecurityCloud })`.
+ */
+export interface CodexSecurityCloudRoute {
+	/** Base URL that reaches `chatgpt.com/backend-api/aardvark` with the provider's credential injected. */
+	baseUrl: string;
+	/** ChatGPT user id (the injected credential's `sub` claim) that owns the scan configurations this route creates. */
+	ownerId(signal?: AbortSignal): Promise<string>;
+}
+
+/** Authenticates with one pinned `openai-codex` OAuth row. */
+export interface CodexSecurityCloudOAuthOptions {
 	authStorage: AuthStorage;
 	account: SecurityAccountRef;
 	baseUrl?: string;
 	fetch?: CodexSecurityCloudFetch;
 }
+
+/** Authenticates through an extension provider's {@link CodexSecurityCloudRoute}. */
+export interface CodexSecurityCloudRouteOptions {
+	provider: string;
+	route: CodexSecurityCloudRoute;
+	/** The provider's own key for the route (a proxy stub), sent as the bearer when present. */
+	apiKey: () => Promise<string | undefined>;
+	fetch?: CodexSecurityCloudFetch;
+}
+
+export type CodexSecurityCloudClientOptions = CodexSecurityCloudOAuthOptions | CodexSecurityCloudRouteOptions;
 
 export interface CodexSecurityCloudConfiguration {
 	id: string;
@@ -175,24 +201,41 @@ export class CodexSecurityCloudHttpError extends Error {
 interface CloudRequestOptions {
 	method?: "GET" | "POST";
 	query?: Record<string, string | number | undefined>;
-	body?: JsonObject | ((accessToken: string) => JsonObject);
+	body?: JsonObject;
 	signal?: AbortSignal;
 }
 
+type CloudAuth =
+	| { kind: "oauth"; authStorage: AuthStorage; account: SecurityAccountRef }
+	| { kind: "route"; route: CodexSecurityCloudRoute; apiKey: () => Promise<string | undefined> };
+
 export class CodexSecurityCloudClient {
-	readonly #authStorage: AuthStorage;
-	readonly #account: SecurityAccountRef;
+	readonly #auth: CloudAuth;
 	readonly #baseUrl: string;
 	readonly #fetch: CodexSecurityCloudFetch;
 
 	constructor(options: CodexSecurityCloudClientOptions) {
-		if (options.account.provider !== "openai-codex") {
-			throw new Error("Codex Security cloud requires an openai-codex ChatGPT OAuth credential");
+		if ("route" in options) {
+			this.#auth = { kind: "route", route: options.route, apiKey: options.apiKey };
+			this.#baseUrl = options.route.baseUrl.replace(/\/$/, "");
+		} else {
+			if (options.account.provider !== "openai-codex") {
+				throw new Error("Codex Security cloud requires an openai-codex ChatGPT OAuth credential");
+			}
+			this.#auth = { kind: "oauth", authStorage: options.authStorage, account: options.account };
+			this.#baseUrl = (options.baseUrl ?? DEFAULT_CLOUD_BASE_URL).replace(/\/$/, "");
 		}
-		this.#authStorage = options.authStorage;
-		this.#account = options.account;
-		this.#baseUrl = (options.baseUrl ?? DEFAULT_CLOUD_BASE_URL).replace(/\/$/, "");
 		this.#fetch = options.fetch ?? fetch;
+	}
+
+	async #send(url: URL, options: CloudRequestOptions, headers: Record<string, string>): Promise<Response> {
+		if (options.body) headers["Content-Type"] = "application/json";
+		return this.#fetch(url, {
+			method: options.method ?? "GET",
+			headers,
+			body: options.body ? JSON.stringify(options.body) : undefined,
+			signal: options.signal,
+		});
 	}
 
 	async #request(pathname: string, options: CloudRequestOptions = {}): Promise<JsonObject> {
@@ -200,34 +243,48 @@ export class CodexSecurityCloudClient {
 		for (const [key, value] of Object.entries(options.query ?? {})) {
 			if (value !== undefined) url.searchParams.set(key, String(value));
 		}
+		const auth = this.#auth;
+		if (auth.kind === "route") {
+			// The route's proxy owns the credential, its refresh, and the account header.
+			const headers: Record<string, string> = { Accept: "application/json" };
+			const apiKey = await auth.apiKey();
+			if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+			const response = await this.#send(url, options, headers);
+			if (!response.ok) throw new CodexSecurityCloudHttpError(response.status, url.pathname);
+			return object(await response.json());
+		}
 		let rejectedAccessToken: string | undefined;
 		for (let attempt = 0; attempt < 2; attempt += 1) {
-			const access = await resolveExactSecurityOAuthAccess(this.#authStorage, this.#account, {
+			const access = await resolveExactSecurityOAuthAccess(auth.authStorage, auth.account, {
 				forceRefresh: attempt > 0,
 				refreshReason: attempt > 0 ? "auth-recovery" : undefined,
 				rejectedAccessToken,
 				signal: options.signal,
 			});
 			rejectedAccessToken = access.accessToken;
-			const body = typeof options.body === "function" ? options.body(access.accessToken) : options.body;
 			const headers: Record<string, string> = {
 				Accept: "application/json",
 				Authorization: `Bearer ${access.accessToken}`,
 			};
-			const accountId = access.accountId ?? this.#account.accountId;
+			const accountId = access.accountId ?? auth.account.accountId;
 			if (accountId) headers["ChatGPT-Account-Id"] = accountId;
-			if (body) headers["Content-Type"] = "application/json";
-			const response = await this.#fetch(url, {
-				method: options.method ?? "GET",
-				headers,
-				body: body ? JSON.stringify(body) : undefined,
-				signal: options.signal,
-			});
+			const response = await this.#send(url, options, headers);
 			if (response.status === 401 && attempt === 0) continue;
 			if (!response.ok) throw new CodexSecurityCloudHttpError(response.status, url.pathname);
 			return object(await response.json());
 		}
 		throw new Error("Codex Security cloud authentication refresh failed");
+	}
+
+	/** ChatGPT user id that owns configurations created by this client. */
+	async #ownerId(signal?: AbortSignal): Promise<string> {
+		const auth = this.#auth;
+		if (auth.kind === "route") return requiredString(await auth.route.ownerId(signal), "authenticated user id");
+		const access = await resolveExactSecurityOAuthAccess(auth.authStorage, auth.account, {
+			forceRefresh: false,
+			signal,
+		});
+		return jwtSubject(access.accessToken);
 	}
 
 	async listConfigurations(
@@ -274,26 +331,24 @@ export class CodexSecurityCloudClient {
 		) {
 			throw new Error("lookbackDays must be a positive integer or 'all'");
 		}
+		const scanInput: JsonObject = {
+			environment_id: input.environmentId,
+			lookback_days: input.lookbackDays === "all" ? null : (input.lookbackDays ?? 30),
+			notification_rules: [],
+			owner_id: await this.#ownerId(input.signal),
+			repo_id: input.repositoryId,
+			repo_url: input.repositoryUrl,
+			share_targets: [],
+			state: "enabled",
+		};
+		if (input.maintainerAttackConcerns) scanInput.maintainer_attack_concerns = input.maintainerAttackConcerns;
+		if (input.maintainerFocusAreas) scanInput.maintainer_focus_areas = input.maintainerFocusAreas;
+		if (input.maintainerAdditionalContext)
+			scanInput.maintainer_additional_context = input.maintainerAdditionalContext;
 		const raw = await this.#request("scan_configurations", {
 			method: "POST",
 			signal: input.signal,
-			body: accessToken => {
-				const scanInput: JsonObject = {
-					environment_id: input.environmentId,
-					lookback_days: input.lookbackDays === "all" ? null : (input.lookbackDays ?? 30),
-					notification_rules: [],
-					owner_id: jwtSubject(accessToken),
-					repo_id: input.repositoryId,
-					repo_url: input.repositoryUrl,
-					share_targets: [],
-					state: "enabled",
-				};
-				if (input.maintainerAttackConcerns) scanInput.maintainer_attack_concerns = input.maintainerAttackConcerns;
-				if (input.maintainerFocusAreas) scanInput.maintainer_focus_areas = input.maintainerFocusAreas;
-				if (input.maintainerAdditionalContext)
-					scanInput.maintainer_additional_context = input.maintainerAdditionalContext;
-				return { scan_input: scanInput };
-			},
+			body: { scan_input: scanInput },
 		});
 		return normalizeConfiguration(raw);
 	}
@@ -370,6 +425,58 @@ export class CodexSecurityCloudClient {
 		// configuration id, so re-verify attribution on each detail response before import.
 		return details.filter(attributed);
 	}
+}
+
+/** What picks the account or provider route behind Codex Security cloud actions. */
+export interface CodexSecurityCloudSelection {
+	authStorage: AuthStorage;
+	registry: Pick<ModelRegistry, "codexSecurityCloudRoutes" | "resolver">;
+	/** Pins one `openai-codex` OAuth row. */
+	credentialId?: number;
+	/** `openai-codex` for OAuth, or an extension provider with a registered route. */
+	provider?: string;
+	sessionId?: string;
+	fetch?: CodexSecurityCloudFetch;
+}
+
+/**
+ * Client for the selected cloud identity. A stored `openai-codex` OAuth account
+ * wins; without one, the sole extension route serves. An explicit `provider`
+ * picks a route, and several routes require it rather than guessing.
+ */
+export function createCodexSecurityCloudClient(selection: CodexSecurityCloudSelection): CodexSecurityCloudClient {
+	const { authStorage, registry, credentialId, provider, sessionId, fetch } = selection;
+	const routes = registry.codexSecurityCloudRoutes();
+	const routeClient = (name: string, route: CodexSecurityCloudRoute) =>
+		new CodexSecurityCloudClient({
+			provider: name,
+			route,
+			apiKey: () => resolveApiKeyOnce(registry.resolver(name, { sessionId })),
+			fetch,
+		});
+	if (provider !== undefined && provider !== "openai-codex") {
+		if (credentialId !== undefined) {
+			throw new Error("credential_id pins an openai-codex OAuth account and cannot select a provider route");
+		}
+		const route = routes.get(provider);
+		if (!route) {
+			const available = [...routes.keys()].join(", ") || "none";
+			throw new Error(`${provider} has no Codex Security cloud route (routes: ${available})`);
+		}
+		return routeClient(provider, route);
+	}
+	const account = findSecurityOAuthAccount(authStorage, "openai-codex", credentialId, sessionId);
+	if (account) return new CodexSecurityCloudClient({ authStorage, account, fetch });
+	if (provider === undefined && routes.size === 1) {
+		const [[name, route]] = routes;
+		return routeClient(name, route);
+	}
+	if (provider === undefined && routes.size > 1) {
+		throw new Error(
+			`Several Codex Security cloud routes are registered (${[...routes.keys()].join(", ")}); choose one with cloud_provider`,
+		);
+	}
+	throw new Error("Security scans require a stored OAuth account for openai-codex");
 }
 
 function normalizePath(value: unknown): string | undefined {

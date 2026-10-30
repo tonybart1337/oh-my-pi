@@ -4,8 +4,11 @@ import { prompt } from "@oh-my-pi/pi-utils";
 import { parseInternalUrl } from "../../internal-urls/parse";
 import { SecurityProtocolHandler } from "../../internal-urls/security-protocol";
 import validationRequestPrompt from "../../prompts/security/validate-request.md" with { type: "text" };
-import { selectSecurityOAuthAccount } from "../../security/auth";
-import { CodexSecurityCloudClient, pullCodexSecurityCloudResults } from "../../security/cloud";
+import {
+	type CodexSecurityCloudClient,
+	createCodexSecurityCloudClient,
+	pullCodexSecurityCloudResults,
+} from "../../security/cloud";
 import type { SecurityDispositionStatus } from "../../security/contracts";
 import type { SecurityPreflightInput } from "../../security/coordinator";
 import { getSecurityCoordinator } from "../../security/coordinator";
@@ -219,6 +222,7 @@ async function exportResults(runtime: SlashCommandRuntime, repository: string, r
 
 interface CloudCliOptions {
 	credentialId?: number;
+	provider?: string;
 	configurationId?: string;
 	repositoryId?: string;
 	repositoryUrl?: string;
@@ -235,6 +239,9 @@ function parseCloudOptions(rest: string, subcommand: string): CloudCliOptions {
 		switch (token) {
 			case "--credential":
 				options.credentialId = parsePositiveCredential(requireToken(tokens, ++index, token));
+				break;
+			case "--provider":
+				options.provider = requireToken(tokens, ++index, token);
 				break;
 			case "--repo-id":
 				options.repositoryId = requireToken(tokens, ++index, token);
@@ -268,17 +275,21 @@ function parseCloudOptions(rest: string, subcommand: string): CloudCliOptions {
 	return options;
 }
 
-function cloudClientFor(runtime: SlashCommandRuntime, credentialId?: number): CodexSecurityCloudClient {
-	const authStorage = runtime.session.modelRegistry.authStorage;
-	const account = selectSecurityOAuthAccount(authStorage, "openai-codex", credentialId, runtime.session.sessionId);
-	return new CodexSecurityCloudClient({ authStorage, account });
+function cloudClientFor(runtime: SlashCommandRuntime, options: CloudCliOptions): CodexSecurityCloudClient {
+	return createCodexSecurityCloudClient({
+		authStorage: runtime.session.modelRegistry.authStorage,
+		registry: runtime.session.modelRegistry,
+		credentialId: options.credentialId,
+		provider: options.provider,
+		sessionId: runtime.session.sessionId,
+	});
 }
 
 async function handleCloudCommand(runtime: SlashCommandRuntime, repository: string, rest: string): Promise<void> {
 	const { verb, rest: optionsText } = parseSubcommand(rest);
 	const subcommand = verb || "scans";
 	const options = parseCloudOptions(optionsText, subcommand);
-	const client = cloudClientFor(runtime, options.credentialId);
+	const client = cloudClientFor(runtime, options);
 	switch (subcommand) {
 		case "scans": {
 			const configurations = await client.listAllConfigurations();
