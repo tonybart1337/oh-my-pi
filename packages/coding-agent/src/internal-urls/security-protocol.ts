@@ -1,4 +1,3 @@
-import * as path from "node:path";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { isSettingsInitialized, settings } from "../config/settings";
 
@@ -172,6 +171,11 @@ export class SecurityProtocolHandler implements ProtocolHandler {
 				store = candidate;
 				break;
 			}
+		}
+		if (!store) {
+			// Scanned from elsewhere (another repository, a since-removed worktree): ids are global.
+			store = await SecurityStore.openForScan(scanId, { signal: context?.signal });
+			bundle = store ? await store.getBundle(scanId) : null;
 		}
 		if (!store || !bundle) throw new Error(`Unknown security scan: ${scanId}`);
 		if (parts.length === 2) {
