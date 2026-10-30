@@ -92,11 +92,7 @@ import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import type { NativeToolView } from "@oh-my-pi/pi-tui/tools/renderer";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
-import type {
-	AsyncJobInspection,
-	EphemeralTurnOptions,
-	EphemeralTurnResult,
-} from "../../session/agent-session-types";
+import type { AsyncJobInspection, EphemeralTurnOptions, EphemeralTurnResult } from "../../session/agent-session-types";
 import type { CompactMode } from "../../session/compact-modes";
 import type { CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
@@ -2190,6 +2186,12 @@ export interface ProviderConfig {
 	headers?: Record<string, string>;
 	/** If true, adds Authorization: Bearer header with the resolved API key. */
 	authHeader?: boolean;
+	/**
+	 * APIs whose transport resolves the real credential without a stored account, e.g. a proxy
+	 * that swaps a stub `apiKey` for its own. Security scans accept these models without a
+	 * `/login` OAuth row and authenticate through this provider's normal key resolution.
+	 */
+	nativeAuthApis?: Api[];
 	/** Models to register. If provided, replaces all existing models for this provider. */
 	models?: ProviderModelConfig[];
 	/** Optional normalized usage fetcher used by AuthStorage for this provider. */

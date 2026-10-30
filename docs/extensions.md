@@ -217,6 +217,8 @@ Extension-registered providers (`registerProvider`) can supply `fetchDynamicMode
 
 A provider's `apiKey` (a literal key or an environment variable name) normally overrides any stored OAuth or `/login` credential for that provider. When the registration also supplies `oauth`, `apiKey` becomes a fallback instead: the key the user saved with `/login` wins, and `apiKey` is used only when no stored login credential exists. This keeps an unset env-var name from being sent as the literal key. Registering a built-in provider id with both `oauth` and a gateway `apiKey` therefore lets a stored upstream credential take precedence over the gateway key.
 
+Native security scans pin either one stored OAuth account or a provider-owned auth route. A proxy provider whose transport injects the real credential (its `apiKey` is a stub) can declare that with `nativeAuthApis: ["anthropic-messages"]` (the APIs it serves): its models then plan and run scans without a `/login` row, authenticating through the provider's normal key resolution. Re-registering without the field, or unregistering, revokes it.
+
 Provider login callbacks can request masked entry with
 `callbacks.onPrompt({ message: "Consumer key", secret: true })`. Native `/login`
 and first-run setup preserve the exact submitted value while hiding it in the

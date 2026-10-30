@@ -251,6 +251,7 @@ async function createDefaultSecuritySession(input: SecurityScanSessionFactoryInp
 		model: input.model,
 		getApiKey: createSecurityAuthResolver({
 			authStorage: input.host.authStorage,
+			nativeAuthApis: input.host.modelRegistry,
 			auth: input.plan.account,
 			providerResolver: model => input.host.modelRegistry.resolver(model, providerSessionId),
 		}),
@@ -434,7 +435,13 @@ export class SecurityCoordinator {
 		}
 		const model = input.model ?? this.#host.activeModel;
 		if (!model) throw new Error("Security scan preflight requires an active model");
-		const account = selectSecurityAuth(this.#host.authStorage, model, input.credentialId, this.#host.sessionId);
+		const account = selectSecurityAuth(
+			this.#host.authStorage,
+			this.#host.modelRegistry,
+			model,
+			input.credentialId,
+			this.#host.sessionId,
+		);
 		const store = await this.#openStore(this.#host.cwd);
 		const workRoot = path.join(store.projectDirectory, "work");
 		await fs.mkdir(workRoot, { recursive: true, mode: 0o700 });
