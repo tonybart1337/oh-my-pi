@@ -3,11 +3,12 @@ import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { isSettingsInitialized, settings } from "../config/settings";
 
 import securityDoc from "../prompts/internal-urls/security.md" with { type: "text" };
-import type { SecurityFinding } from "../security/contracts";
+import type { SecurityFinding, SecurityScanBundle } from "../security/contracts";
 import { createPublicSecurityScan, redactPrivateSecurityMetadata } from "../security/provenance";
 import { createSecurityResource } from "../security/resource-output";
 import type { SecurityScanSummary } from "../security/store";
 import { SecurityStore } from "../security/store";
+import { securityWorkspaceRoots } from "../security/workspace";
 import type {
 	InternalResource,
 	InternalUrl,
@@ -51,7 +52,7 @@ function splitSecurityPath(url: InternalUrl): string[] {
 }
 
 function formatScans(scans: SecurityScanSummary[]): string {
-	if (scans.length === 0) return "# Security scans\n\nNo scans are stored for this project.\n";
+	if (scans.length === 0) return "# Security scans\n\nNo scans are stored for this workspace.\n";
 	const rows = scans.map(
 		scan =>
 			`- \`${scan.id}\` — ${scan.status}; ${scan.findingCount} finding(s); ${scan.producer.name}; ${scan.createdAt}`,
@@ -119,14 +120,25 @@ export class SecurityProtocolHandler implements ProtocolHandler {
 		return host.securityEnabled ? securityDoc.trim() : undefined;
 	}
 
-	async #store(context?: ResolveContext): Promise<SecurityStore> {
-		return this.#resolveStore(path.resolve(context?.cwd ?? process.cwd()), context?.signal);
+	/** One store per repository among the caller's workspace roots: the cwd first, then `/add-dir` directories. */
+	async #stores(context?: ResolveContext): Promise<SecurityStore[]> {
+		const roots = securityWorkspaceRoots(context?.cwd ?? process.cwd(), context?.session?.additionalDirectories);
+		const stores: SecurityStore[] = [];
+		for (const root of roots) {
+			const store = await this.#resolveStore(root, context?.signal);
+			if (!stores.some(existing => existing.projectDirectory === store.projectDirectory)) stores.push(store);
+		}
+		return stores;
+	}
+
+	async #listScans(context?: ResolveContext): Promise<SecurityScanSummary[]> {
+		const listings = await Promise.all((await this.#stores(context)).map(store => store.listScans()));
+		return listings.flat();
 	}
 
 	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
 		if (!(securityEnabledFromContext(context) ?? this.#enabled())) throw new SecurityDisabledError();
 		const parts = splitSecurityPath(url);
-		const store = await this.#store(context);
 		if (parts.length === 0) {
 			return createSecurityResource({
 				url: "security://",
@@ -146,14 +158,22 @@ export class SecurityProtocolHandler implements ProtocolHandler {
 		if (parts.length === 1) {
 			return createSecurityResource({
 				url: "security://scans",
-				content: formatScans(await store.listScans()),
+				content: formatScans(await this.#listScans(context)),
 				contentType: "text/markdown",
 				isDirectory: true,
 			});
 		}
 		const scanId = parts[1];
-		const bundle = await store.getBundle(scanId);
-		if (!bundle) throw new Error(`Unknown security scan: ${scanId}`);
+		let store: SecurityStore | undefined;
+		let bundle: SecurityScanBundle | null = null;
+		for (const candidate of await this.#stores(context)) {
+			bundle = await candidate.getBundle(scanId);
+			if (bundle) {
+				store = candidate;
+				break;
+			}
+		}
+		if (!store || !bundle) throw new Error(`Unknown security scan: ${scanId}`);
 		if (parts.length === 2) {
 			return createSecurityResource({
 				url: `security://scans/${scanId}`,
@@ -243,8 +263,7 @@ export class SecurityProtocolHandler implements ProtocolHandler {
 
 	async complete(query = "", context?: ResolveContext): Promise<UrlCompletion[]> {
 		if (!(securityEnabledFromContext(context) ?? this.#enabled())) return [];
-		const store = await this.#store(context);
-		const scans = await store.listScans();
+		const scans = await this.#listScans(context);
 		const candidates: UrlCompletion[] = [{ value: "scans", label: "Scans", description: "Stored security scans" }];
 		for (const scan of scans.slice(0, 50)) {
 			const prefix = `scans/${scan.id}`;

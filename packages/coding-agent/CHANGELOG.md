@@ -30,6 +30,7 @@
 ### Added
 
 - Extension providers can declare `nativeAuthApis` in `registerProvider`, so proxies that inject their own credential can run native security scans without a stored OAuth account.
+- Security scans can target any repository in the session workspace: `security_scan` takes `repository` and `/security` a leading `--repo <path>`, accepted for the working directory or an `/add-dir` workspace directory. `security://` lists and resolves scans across those workspace roots.
 
 ## [18.14.0] - 2026-10-29
 

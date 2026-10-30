@@ -12,6 +12,7 @@ import { getSecurityCoordinator } from "../../security/coordinator";
 import { importCodexSecurityBundle, importSarifFile } from "../../security/importers";
 import type { SecurityTargetRequest } from "../../security/preflight";
 import { SecurityStore, writeSecurityFileAtomic } from "../../security/store";
+import { resolveSecurityRepository } from "../../security/workspace";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { parseCommandArgs } from "../../utils/command-args";
 import type { ParsedSlashCommand, SlashCommandResult, SlashCommandRuntime } from "../types";
@@ -35,9 +36,9 @@ const DISPOSITIONS: ReadonlySet<SecurityDispositionStatus> = new Set([
 	"wont_fix",
 ]);
 
-function coordinatorFor(runtime: SlashCommandRuntime) {
+function coordinatorFor(runtime: SlashCommandRuntime, repository: string) {
 	return getSecurityCoordinator({
-		cwd: runtime.cwd,
+		cwd: repository,
 		settings: runtime.settings,
 		authStorage: runtime.session.modelRegistry.authStorage,
 		modelRegistry: runtime.session.modelRegistry,
@@ -48,6 +49,13 @@ function coordinatorFor(runtime: SlashCommandRuntime) {
 	});
 }
 
+/** Split a leading `--repo <path>` (one of the session's workspace roots) off the `/security` arguments. */
+function splitRepositoryOption(args: string): { repository?: string; rest: string } {
+	const match = args.match(/^\s*--repo\s+(?:"([^"]*)"|'([^']*)'|(\S+))([\s\S]*)$/);
+	if (match) return { repository: match[1] ?? match[2] ?? match[3], rest: match[4]! };
+	if (/^\s*--repo\s*$/.test(args)) throw new Error("--repo requires a path");
+	return { rest: args };
+}
 function requireToken(tokens: readonly string[], index: number, flag: string): string {
 	const value = tokens[index];
 	if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value`);
@@ -123,7 +131,7 @@ function parsePlanOptions(rest: string): SecurityPlanCliOptions {
 	return { target, knowledgeBasePaths, outputRoot, archiveExisting, credentialId };
 }
 
-async function preflight(runtime: SlashCommandRuntime, rest: string) {
+async function preflight(runtime: SlashCommandRuntime, repository: string, rest: string) {
 	const options = parsePlanOptions(rest);
 	const input: SecurityPreflightInput = {
 		target: options.target,
@@ -133,7 +141,7 @@ async function preflight(runtime: SlashCommandRuntime, rest: string) {
 		credentialId: options.credentialId,
 		model: runtime.session.model,
 	};
-	return coordinatorFor(runtime).preflight(input);
+	return coordinatorFor(runtime, repository).preflight(input);
 }
 
 function scanIdFromInput(value: string): string {
@@ -151,19 +159,19 @@ function findingTarget(value: string): { uri: string; scanId: string; findingId:
 	return { uri: `security://scans/${scanId}/findings/${findingId}`, scanId, findingId };
 }
 
-async function showResource(runtime: SlashCommandRuntime, rest: string): Promise<void> {
+async function showResource(runtime: SlashCommandRuntime, repository: string, rest: string): Promise<void> {
 	const raw = rest.trim();
 	if (!raw) throw new Error("show requires a scan id or security:// URI");
 	const uri = raw.startsWith("security://") ? raw : `security://scans/${scanIdFromInput(raw)}`;
 	const handler = new SecurityProtocolHandler(undefined, () => true);
-	const resource = await handler.resolve(parseInternalUrl(uri), { cwd: runtime.cwd });
+	const resource = await handler.resolve(parseInternalUrl(uri), { cwd: repository });
 	await runtime.output(resource.content);
 }
 
-async function importResults(runtime: SlashCommandRuntime, rest: string): Promise<void> {
+async function importResults(runtime: SlashCommandRuntime, repository: string, rest: string): Promise<void> {
 	const [source] = parseCommandArgs(rest);
 	if (!source) throw new Error("import requires a SARIF file or Codex Security bundle directory");
-	const store = await SecurityStore.openForCwd(runtime.cwd);
+	const store = await SecurityStore.openForCwd(repository);
 	const absolute = path.resolve(runtime.cwd, source);
 	const stats = await fs.stat(absolute);
 	const bundle = stats.isDirectory()
@@ -173,7 +181,7 @@ async function importResults(runtime: SlashCommandRuntime, rest: string): Promis
 	await runtime.output(`Imported ${bundle.findings.length} finding(s) as security scan ${bundle.scan.id}.`);
 }
 
-async function exportResults(runtime: SlashCommandRuntime, rest: string): Promise<void> {
+async function exportResults(runtime: SlashCommandRuntime, repository: string, rest: string): Promise<void> {
 	const tokens = parseCommandArgs(rest);
 	const scanId = tokens[0];
 	if (!scanId) throw new Error("export requires <scan-id> --output <path> [--format bundle|sarif|report]");
@@ -191,7 +199,7 @@ async function exportResults(runtime: SlashCommandRuntime, rest: string): Promis
 		} else throw new Error(`Unknown export option: ${token}`);
 	}
 	if (!outputPath) throw new Error("export requires --output <path>");
-	const store = await SecurityStore.openForCwd(runtime.cwd);
+	const store = await SecurityStore.openForCwd(repository);
 	const bundle = await store.getBundle(scanIdFromInput(scanId));
 	if (!bundle) throw new Error(`Unknown security scan: ${scanId}`);
 	let content: string;
@@ -266,7 +274,7 @@ function cloudClientFor(runtime: SlashCommandRuntime, credentialId?: number): Co
 	return new CodexSecurityCloudClient({ authStorage, account });
 }
 
-async function handleCloudCommand(runtime: SlashCommandRuntime, rest: string): Promise<void> {
+async function handleCloudCommand(runtime: SlashCommandRuntime, repository: string, rest: string): Promise<void> {
 	const { verb, rest: optionsText } = parseSubcommand(rest);
 	const subcommand = verb || "scans";
 	const options = parseCloudOptions(optionsText, subcommand);
@@ -317,7 +325,7 @@ async function handleCloudCommand(runtime: SlashCommandRuntime, rest: string): P
 		}
 		case "pull": {
 			if (!options.configurationId) throw new Error("cloud pull requires a configuration id");
-			const store = await SecurityStore.openForCwd(runtime.cwd);
+			const store = await SecurityStore.openForCwd(repository);
 			const bundle = await pullCodexSecurityCloudResults({
 				client,
 				configurationId: options.configurationId,
@@ -333,7 +341,7 @@ async function handleCloudCommand(runtime: SlashCommandRuntime, rest: string): P
 	}
 }
 
-async function updateDisposition(runtime: SlashCommandRuntime, rest: string): Promise<void> {
+async function updateDisposition(runtime: SlashCommandRuntime, repository: string, rest: string): Promise<void> {
 	const [scanId, findingId, status, ...rationaleParts] = parseCommandArgs(rest);
 	if (!scanId || !findingId || !status) {
 		throw new Error("disposition requires <scan-id> <finding-id> <status> [rationale]");
@@ -341,7 +349,7 @@ async function updateDisposition(runtime: SlashCommandRuntime, rest: string): Pr
 	if (!DISPOSITIONS.has(status as SecurityDispositionStatus)) throw new Error(`Unknown disposition: ${status}`);
 	const rationale = rationaleParts.join(" ").trim();
 	if (status !== "open" && !rationale) throw new Error(`${status} requires a rationale`);
-	const store = await SecurityStore.openForCwd(runtime.cwd);
+	const store = await SecurityStore.openForCwd(repository);
 	const finding = await store.updateDisposition(scanId, findingId, {
 		status: status as SecurityDispositionStatus,
 		rationale: rationale || undefined,
@@ -358,23 +366,31 @@ export async function handleSecurityCommand(
 	if (!cfgSecurityEnabled.get(runtime.settings)) {
 		return usage("Security is disabled. Enable security.enabled before using /security.", runtime);
 	}
-	const { verb, rest } = parseSubcommand(command.args);
 	try {
+		const option = splitRepositoryOption(command.args);
+		const repository = resolveSecurityRepository(
+			runtime.cwd,
+			runtime.sessionManager.getAdditionalDirectories(),
+			option.repository,
+		);
+		const { verb, rest } = parseSubcommand(option.rest);
 		switch (verb || "scans") {
 			case "plan": {
-				const plan = await preflight(runtime, rest);
+				const plan = await preflight(runtime, repository, rest);
 				await runtime.output(`Security plan ${plan.id} is ready. Fingerprint: ${plan.fingerprint}.`);
 				return commandConsumed();
 			}
 			case "scan": {
-				const coordinator = coordinatorFor(runtime);
-				const planId = rest.trim().startsWith("secplan_") ? rest.trim() : (await preflight(runtime, rest)).id;
+				const coordinator = coordinatorFor(runtime, repository);
+				const planId = rest.trim().startsWith("secplan_")
+					? rest.trim()
+					: (await preflight(runtime, repository, rest)).id;
 				const operation = await coordinator.start({ planId });
 				await runtime.output(`Security scan ${operation.scanId} started as ${operation.operationId}.`);
 				return commandConsumed();
 			}
 			case "status": {
-				const coordinator = coordinatorFor(runtime);
+				const coordinator = coordinatorFor(runtime, repository);
 				const operationId = rest.trim();
 				if (operationId) {
 					const operation = await coordinator.status(operationId);
@@ -389,14 +405,14 @@ export async function handleSecurityCommand(
 				const operationId = rest.trim();
 				if (!operationId) throw new Error("cancel requires an operation id");
 				await runtime.output(
-					(await coordinatorFor(runtime).cancel(operationId))
+					(await coordinatorFor(runtime, repository).cancel(operationId))
 						? `Cancellation requested for ${operationId}.`
 						: `No cancellable security operation ${operationId}.`,
 				);
 				return commandConsumed();
 			}
 			case "scans": {
-				const scans = await (await SecurityStore.openForCwd(runtime.cwd)).listScans();
+				const scans = await (await SecurityStore.openForCwd(repository)).listScans();
 				await runtime.output(
 					scans.length === 0
 						? "No security scans are stored for this project."
@@ -407,13 +423,13 @@ export async function handleSecurityCommand(
 				return commandConsumed();
 			}
 			case "show":
-				await showResource(runtime, rest);
+				await showResource(runtime, repository, rest);
 				return commandConsumed();
 			case "import":
-				await importResults(runtime, rest);
+				await importResults(runtime, repository, rest);
 				return commandConsumed();
 			case "export":
-				await exportResults(runtime, rest);
+				await exportResults(runtime, repository, rest);
 				return commandConsumed();
 			case "validate": {
 				const target = findingTarget(rest);
@@ -423,6 +439,7 @@ export async function handleSecurityCommand(
 							findingUri: target.uri,
 							scanId: target.scanId,
 							findingId: target.findingId,
+							repository: option.repository === undefined ? undefined : repository,
 						})
 						.trim(),
 				};
@@ -430,19 +447,19 @@ export async function handleSecurityCommand(
 			case "compare": {
 				const [beforeScanId, afterScanId] = parseCommandArgs(rest);
 				if (!beforeScanId || !afterScanId) throw new Error("compare requires <before-scan-id> <after-scan-id>");
-				const report = await (await SecurityStore.openForCwd(runtime.cwd)).compare(beforeScanId, afterScanId);
+				const report = await (await SecurityStore.openForCwd(repository)).compare(beforeScanId, afterScanId);
 				await runtime.output(JSON.stringify(report, null, 2));
 				return commandConsumed();
 			}
 			case "cloud":
-				await handleCloudCommand(runtime, rest);
+				await handleCloudCommand(runtime, repository, rest);
 				return commandConsumed();
 			case "disposition":
-				await updateDisposition(runtime, rest);
+				await updateDisposition(runtime, repository, rest);
 				return commandConsumed();
 			default:
 				return usage(
-					"Usage: /security <plan|scan|status|cancel|scans|cloud|show|import|export|validate|compare|disposition>",
+					"Usage: /security [--repo <workspace dir>] <plan|scan|status|cancel|scans|cloud|show|import|export|validate|compare|disposition>",
 					runtime,
 				);
 		}

@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { refreshDirsFromEnv } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
+import { parseInternalUrl } from "../../src/internal-urls/parse";
+import { SecurityProtocolHandler } from "../../src/internal-urls/security-protocol";
 import { SecurityStore } from "../../src/security";
 import { handleSecurityCommand } from "../../src/slash-commands/helpers/security";
 import type { SlashCommandRuntime } from "../../src/slash-commands/types";
@@ -38,10 +40,12 @@ afterEach(async () => {
 	await fs.rm(temporaryRoot, { recursive: true, force: true });
 });
 
-function runtime(): SlashCommandRuntime {
+function runtime(additionalDirectories: string[] = []): SlashCommandRuntime {
 	return {
 		session: {} as SlashCommandRuntime["session"],
-		sessionManager: {} as SlashCommandRuntime["sessionManager"],
+		sessionManager: {
+			getAdditionalDirectories: () => additionalDirectories,
+		} as unknown as SlashCommandRuntime["sessionManager"],
 		settings,
 		cwd: repositoryRoot,
 		output: text => {
@@ -52,8 +56,8 @@ function runtime(): SlashCommandRuntime {
 	};
 }
 
-async function command(args: string) {
-	return handleSecurityCommand({ name: "security", args, text: `/security ${args}` }, runtime());
+async function command(args: string, additionalDirectories?: string[]) {
+	return handleSecurityCommand({ name: "security", args, text: `/security ${args}` }, runtime(additionalDirectories));
 }
 
 describe("/security", () => {
@@ -140,6 +144,27 @@ describe("/security", () => {
 		expect(result).toEqual({
 			prompt: expect.stringContaining("security://scans/secscan_fixture/findings/secf_fixture"),
 		});
+	});
+
+	test("--repo reaches another repository only after /add-dir admitted it", async () => {
+		const otherRoot = path.join(temporaryRoot, "other");
+		await fs.mkdir(otherRoot);
+		const importIntoOther = `--repo ${JSON.stringify(otherRoot)} import ${JSON.stringify(SARIF_FIXTURE)}`;
+		await command(importIntoOther);
+		expect(output.at(-1)).toContain("outside this session's workspace");
+		expect(await (await SecurityStore.open(otherRoot)).listScans()).toHaveLength(0);
+
+		await command(importIntoOther, [otherRoot]);
+		const [scan] = await (await SecurityStore.open(otherRoot)).listScans();
+		if (!scan) throw new Error("expected scan imported into the added repository");
+		expect(await (await SecurityStore.open(repositoryRoot)).listScans()).toHaveLength(0);
+
+		// security:// finds the scan through the caller's workspace roots, and only through them.
+		const handler = new SecurityProtocolHandler(undefined, () => true);
+		const url = parseInternalUrl(`security://scans/${scan.id}`);
+		const session = { additionalDirectories: [otherRoot] } as ToolSession;
+		expect((await handler.resolve(url, { cwd: repositoryRoot, session })).content).toContain(scan.id);
+		await expect(handler.resolve(url, { cwd: repositoryRoot })).rejects.toThrow("Unknown security scan");
 	});
 
 	test("disabled command is refused without touching session state", async () => {

@@ -11,3 +11,4 @@ export * from "./remediation";
 export * from "./resource-output";
 export * from "./sarif";
 export * from "./store";
+export * from "./workspace";
