@@ -1,11 +1,11 @@
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult, ToolTier } from "@oh-my-pi/pi-agent-core";
 import securityScanDescription from "../prompts/tools/security-scan.md" with { type: "text" };
-import { selectSecurityOAuthAccount } from "../security/auth";
 import {
-	CodexSecurityCloudClient,
+	type CodexSecurityCloudClient,
 	type CodexSecurityCloudConfiguration,
 	type CodexSecurityCloudStats,
+	createCodexSecurityCloudClient,
 	pullCodexSecurityCloudResults,
 } from "../security/cloud";
 import { createSecurityEvidenceId, type SecurityEvidence, type SecurityValidationStatus } from "../security/contracts";
@@ -40,6 +40,7 @@ const securityScanSchema = type({
 	"validation_summary?": "string",
 	"validation_evidence?": type({ label: "string > 0", explanation: "string" }).array(),
 	"cloud_configuration_id?": "string",
+	"cloud_provider?": "string",
 	"repository_id?": "string",
 	"repository_url?": "string",
 	"environment_id?": "string",
@@ -91,15 +92,21 @@ function requireValue(value: string | undefined, label: string): string {
 	return value.trim();
 }
 
-function cloudClientForSession(session: ToolSession, credentialId?: number): CodexSecurityCloudClient {
-	if (!session.authStorage) throw new ToolError("Codex Security cloud requires the authentication registry");
-	const account = selectSecurityOAuthAccount(
-		session.authStorage,
-		"openai-codex",
-		credentialId,
-		session.getSessionId?.() ?? undefined,
-	);
-	return new CodexSecurityCloudClient({ authStorage: session.authStorage, account });
+function cloudClientForSession(session: ToolSession, params: SecurityScanParams): CodexSecurityCloudClient {
+	if (!session.authStorage || !session.modelRegistry) {
+		throw new ToolError("Codex Security cloud requires the session model and authentication registries");
+	}
+	try {
+		return createCodexSecurityCloudClient({
+			authStorage: session.authStorage,
+			registry: session.modelRegistry,
+			credentialId: params.credential_id,
+			provider: params.cloud_provider?.trim() || undefined,
+			sessionId: session.getSessionId?.() ?? undefined,
+		});
+	} catch (error) {
+		throw new ToolError(error instanceof Error ? error.message : String(error));
+	}
 }
 
 function textResult(text: string, details: SecurityScanToolDetails): AgentToolResult<SecurityScanToolDetails> {
@@ -207,10 +214,7 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 				);
 			}
 			case "cloud_scans": {
-				const configurations = await cloudClientForSession(
-					this.session,
-					params.credential_id,
-				).listAllConfigurations(signal);
+				const configurations = await cloudClientForSession(this.session, params).listAllConfigurations(signal);
 				return textResult(
 					configurations.length === 0
 						? "No Codex Security cloud scan configurations are available."
@@ -224,7 +228,7 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 				);
 			}
 			case "cloud_start": {
-				const configuration = await cloudClientForSession(this.session, params.credential_id).startScan({
+				const configuration = await cloudClientForSession(this.session, params).startScan({
 					repositoryId: requireValue(params.repository_id, "repository_id"),
 					repositoryUrl: requireValue(params.repository_url, "repository_url"),
 					environmentId: requireValue(params.environment_id, "environment_id"),
@@ -240,7 +244,7 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 				);
 			}
 			case "cloud_status": {
-				const stats = await cloudClientForSession(this.session, params.credential_id).getStats(
+				const stats = await cloudClientForSession(this.session, params).getStats(
 					requireValue(params.cloud_configuration_id, "cloud_configuration_id"),
 					signal,
 				);
@@ -252,7 +256,7 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 			case "cloud_pull": {
 				const store = await SecurityStore.openForCwd(repository, { signal });
 				const bundle = await pullCodexSecurityCloudResults({
-					client: cloudClientForSession(this.session, params.credential_id),
+					client: cloudClientForSession(this.session, params),
 					configurationId: requireValue(params.cloud_configuration_id, "cloud_configuration_id"),
 					store,
 					signal,

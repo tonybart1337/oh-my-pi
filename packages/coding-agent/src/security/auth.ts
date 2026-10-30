@@ -59,7 +59,12 @@ export function assertSecurityIdentityMatches(
 	}
 }
 
-function selectOAuthAccount(
+/**
+ * The exact OAuth row a security operation would pin for `provider`: the requested
+ * credential, else the active or lone account. Undefined when none is stored; throws
+ * when the request is ambiguous or names an unavailable credential.
+ */
+export function findSecurityOAuthAccount(
 	authStorage: AuthStorage,
 	provider: string,
 	requestedCredentialId?: number,
@@ -89,18 +94,6 @@ function selectOAuthAccount(
 	return undefined;
 }
 
-/** Selects one exact OAuth row for native or Codex Security cloud scans. */
-export function selectSecurityOAuthAccount(
-	authStorage: AuthStorage,
-	provider: string,
-	requestedCredentialId?: number,
-	sessionId?: string,
-): SecurityAccountRef {
-	const account = selectOAuthAccount(authStorage, provider, requestedCredentialId, sessionId);
-	if (!account) throw new Error(`Security scans require a stored OAuth account for ${provider}`);
-	return account;
-}
-
 /** Selects either one exact OAuth row or an explicitly supported provider-owned auth route. */
 export function selectSecurityAuth(
 	authStorage: AuthStorage,
@@ -109,7 +102,7 @@ export function selectSecurityAuth(
 	requestedCredentialId?: number,
 	sessionId?: string,
 ): SecurityAuthRef {
-	const account = selectOAuthAccount(authStorage, model.provider, requestedCredentialId, sessionId);
+	const account = findSecurityOAuthAccount(authStorage, model.provider, requestedCredentialId, sessionId);
 	if (account) return account;
 	if (supportsProviderAuth(registry, model)) return { provider: model.provider, api: model.api };
 	if (registry.nativeAuthApis(model.provider)) {
