@@ -219,6 +219,53 @@ describe("native security coordinator", () => {
 		expect(terminal).toMatchObject({ phase: "completed", findingCount: 1 });
 	});
 
+	test("keeps waiting across follow-up turns until the scan publishes, even while the run stays open", async () => {
+		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
+		let followUpTurns = 0;
+		let published = false;
+		let idleWaitsAfterPublish = 0;
+		const disposed = Promise.withResolvers<void>();
+		const coordinator = new SecurityCoordinator(
+			{ cwd: repositoryRoot, settings, authStorage, modelRegistry, activeModel: mock.model },
+			{
+				openStore: storeFactory,
+				gitAdapter,
+				createSession: async input => ({
+					// The lead only dispatches workers; publication happens in a later follow-up turn.
+					prompt: async () => true,
+					waitForIdle: async () => {
+						if (published) idleWaitsAfterPublish++;
+					},
+					waitForRunEnd: async () => {
+						// The first woken turn dispatches more workers; the second publishes.
+						followUpTurns++;
+						await Promise.resolve();
+						followUpTurns++;
+						const tool = input.publicationTool as unknown as {
+							execute(id: string, params: unknown): Promise<unknown>;
+						};
+						await tool.execute("publish", {
+							findings: [],
+							coverage: { completeness: "complete" },
+							report: "# Fixture report\n\nNo findings.\n",
+						});
+						published = true;
+						// A lingering worker keeps the run open; only the publication ends the wait.
+						await disposed.promise;
+					},
+					abort: async () => undefined,
+					dispose: async () => disposed.resolve(),
+				}),
+			},
+		);
+		const plan = await coordinator.preflight({ credentialId, model: mock.model });
+		const terminal = await coordinator.wait((await coordinator.start({ planId: plan.id })).operationId);
+		expect(terminal).toMatchObject({ phase: "completed", findingCount: 0 });
+		expect(followUpTurns).toBe(2);
+		// The publishing turn still finishes before the scan completes.
+		expect(idleWaitsAfterPublish).toBe(1);
+	});
+
 	test("records a terminal failure when initial scan persistence fails", async () => {
 		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
 		const store = await storeFactory();
