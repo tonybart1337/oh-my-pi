@@ -219,6 +219,44 @@ describe("native security coordinator", () => {
 		expect(terminal).toMatchObject({ phase: "completed", findingCount: 1 });
 	});
 
+	test("keeps settling background work across follow-up turns until the scan publishes", async () => {
+		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
+		let pendingGenerations = 2;
+		let settles = 0;
+		const coordinator = new SecurityCoordinator(
+			{ cwd: repositoryRoot, settings, authStorage, modelRegistry, activeModel: mock.model },
+			{
+				openStore: storeFactory,
+				gitAdapter,
+				createSession: async input => ({
+					// The lead only dispatches workers; publication happens in a later follow-up turn.
+					prompt: async () => true,
+					waitForIdle: async () => undefined,
+					hasPendingAsyncWork: () => pendingGenerations > 0,
+					settleAsyncWork: async () => {
+						settles++;
+						pendingGenerations--;
+						if (pendingGenerations > 0) return; // a follow-up turn that dispatched more workers
+						const tool = input.publicationTool as unknown as {
+							execute(id: string, params: unknown): Promise<unknown>;
+						};
+						await tool.execute("publish", {
+							findings: [],
+							coverage: { completeness: "complete" },
+							report: "# Fixture report\n\nNo findings.\n",
+						});
+					},
+					abort: async () => undefined,
+					dispose: async () => undefined,
+				}),
+			},
+		);
+		const plan = await coordinator.preflight({ credentialId, model: mock.model });
+		const terminal = await coordinator.wait((await coordinator.start({ planId: plan.id })).operationId);
+		expect(terminal.phase).toBe("completed");
+		expect(settles).toBe(2);
+	});
+
 	test("records a terminal failure when initial scan persistence fails", async () => {
 		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
 		const store = await storeFactory();
