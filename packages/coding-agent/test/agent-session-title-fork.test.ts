@@ -10,6 +10,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 let session: AgentSession | undefined;
@@ -126,6 +127,24 @@ describe("AgentSession title fork", () => {
 		expect(sideCall.options?.promptCacheKey).toBe(mainCall.options?.promptCacheKey ?? mainCall.options?.sessionId);
 		// The fork runs beside the main turn, which finishes on its own.
 		expect(target.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+	});
+
+	it("titles a session opened by a collab guest's prompt", async () => {
+		const main = createMockModel({ responses: [{ content: ["Reading the park tests first."] }] });
+		const side = createMockModel({ handler: { content: [CARD_REPLY] } });
+		const target = await createSession(main, side);
+		const titled = nextTitle(target);
+
+		await target.promptCustomMessage({
+			customType: COLLAB_PROMPT_MESSAGE_TYPE,
+			content: FIRST_MESSAGE,
+			display: true,
+			details: { from: "guest" },
+			attribution: "user",
+		});
+		await titled;
+
+		expect(target.sessionName).toBe("🧪 FLAKY: Fix flaky park tests");
 	});
 
 	it.each<[string, MockResponse, MockResponse]>([
