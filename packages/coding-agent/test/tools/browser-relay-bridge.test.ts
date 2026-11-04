@@ -3699,6 +3699,7 @@ describe("RelayBridge page overlay", () => {
 			relayConnected: true,
 			inputRequired: false,
 			busy: true,
+			runningSubagents: 0,
 			access: "control" as const,
 		};
 		const installs = [{ dir: "/Users/me/omp-extension", version: "15.0.0", missing: false }];
@@ -3722,7 +3723,12 @@ describe("RelayBridge page overlay", () => {
 		call(4, { op: "installs" });
 		await flush();
 		const results = ext.messages.flatMap(msg => (msg.t === "callResult" ? [msg] : [])).sort((a, b) => a.id - b.id);
-		const { participants: _participants, relayConnected: _relayConnected, ...panelHost } = host;
+		const {
+			participants: _participants,
+			relayConnected: _relayConnected,
+			runningSubagents: _runningSubagents,
+			...panelHost
+		} = host;
 		expect(results).toEqual([
 			{ t: "callResult", id: 1, ok: true, result: [panelHost] },
 			{ t: "callResult", id: 2, ok: true, result: { url: "https://my.omp.sh/#room=abc&token=def" } },

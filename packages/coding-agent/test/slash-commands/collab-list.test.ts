@@ -34,6 +34,7 @@ function snapshot(over: Partial<CollabHostSnapshot> = {}): CollabHostSnapshot {
 		relayConnected: true,
 		inputRequired: false,
 		busy: false,
+		runningSubagents: 0,
 		access: "control",
 		...over,
 	};

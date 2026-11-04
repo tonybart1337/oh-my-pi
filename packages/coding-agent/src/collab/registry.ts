@@ -93,6 +93,12 @@ export interface CollabHostSnapshot {
 	 * that stopped.
 	 */
 	busy: boolean | null;
+	/**
+	 * Subagents of this process still running. They outlive the turn that
+	 * spawned them (async tasks), so a host can be `busy: false` while its
+	 * work continues. `null` when the host does not report it (older omp).
+	 */
+	runningSubagents: number | null;
 	/** Highest access the registry will hand out for this host. */
 	access: CollabAccess;
 }
@@ -225,13 +231,15 @@ const SnapshotShape = type({
 	// snapshot simply omits the field, and a missing one reads as unknown
 	// (`null`) rather than rejecting an otherwise healthy host.
 	"busy?": "boolean | null",
+	// Added after `busy`, under the same unversioned-optional rule.
+	"runningSubagents?": "number.integer >= 0 | null",
 	access: Access,
 });
 
 function parseSnapshot(raw: unknown): CollabHostSnapshot | null {
 	const snapshot = SnapshotShape(raw);
 	if (snapshot instanceof type.errors) return null;
-	return { ...snapshot, busy: snapshot.busy ?? null };
+	return { ...snapshot, busy: snapshot.busy ?? null, runningSubagents: snapshot.runningSubagents ?? null };
 }
 
 function boundField(value: string): string {
