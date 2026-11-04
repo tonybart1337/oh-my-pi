@@ -68,6 +68,7 @@ function makeFixture(over: Partial<CollabHostSnapshot> = {}): Fixture {
 			relayConnected: true,
 			inputRequired: false,
 			busy: false,
+			runningSubagents: 0,
 			access: "control",
 			...over,
 		},
