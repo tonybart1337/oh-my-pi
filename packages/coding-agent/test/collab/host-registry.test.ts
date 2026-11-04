@@ -28,6 +28,7 @@ import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -749,6 +750,28 @@ describe("collab host registry lifecycle (#6099)", () => {
 		state.isStreaming = false;
 		const [idle] = await registry.listCollabHosts({ dir: tmp });
 		expect(idle).toMatchObject({ instanceId: "activity-host", busy: false });
+	});
+
+	it("reports subagents that keep running after the spawning turn ends", async () => {
+		AgentRegistry.resetGlobalForTests();
+		try {
+			const { ctx, state } = makeHostContext();
+			host = new CollabHost(ctx, { instanceId: "subagent-host" });
+			await host.start(RELAY_URL, WEB_URL);
+			const agents = AgentRegistry.global();
+			agents.register({ id: "Main", displayName: "Main", kind: "main", session: null });
+			agents.register({ id: "Worker", displayName: "Worker", kind: "sub", session: null });
+			agents.register({ id: "Done", displayName: "Done", kind: "sub", session: null, status: "idle" });
+
+			state.isStreaming = false;
+			const [working] = await registry.listCollabHosts({ dir: tmp });
+			expect(working).toMatchObject({ busy: false, runningSubagents: 1 });
+
+			agents.setStatus("Worker", "idle");
+			expect((await registry.listCollabHosts({ dir: tmp }))[0]!.runningSubagents).toBe(0);
+		} finally {
+			AgentRegistry.resetGlobalForTests();
+		}
 	});
 
 	it("retains a guest UI request raised before the relay connects", async () => {

@@ -12,6 +12,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs/promises";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import { getRunningSubagentBadgeAgentIds } from "@oh-my-pi/pi-tui/overlays/running-subagent-badge";
 import { logger } from "@oh-my-pi/pi-utils";
 import type {
 	BusChannel,
@@ -770,6 +771,9 @@ export class CollabHost {
 			// the agent ends — so a poller sees the session stop while the room
 			// is still published.
 			busy: this.#ctx.session.isStreaming,
+			// Async subagents keep working after the spawning turn ends; same
+			// count as the footer's running-subagents badge.
+			runningSubagents: getRunningSubagentBadgeAgentIds(AgentRegistry.global()).length,
 			access: this.#access,
 		};
 	}

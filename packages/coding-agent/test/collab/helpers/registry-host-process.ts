@@ -34,6 +34,7 @@ const source: CollabHostRegistrySource = {
 		relayConnected: true,
 		inputRequired: false,
 		busy: false,
+		runningSubagents: 0,
 		access: "control",
 	}),
 	link: access => `https://collab.example/${access}/${marker}`,
