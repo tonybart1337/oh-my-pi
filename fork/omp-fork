@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# omp-fork: keep a locally built omp = latest upstream release + this fork's patches.
+# It installs as `omp-dev`, next to the stock `omp`, which it never touches.
+#
+#   omp-fork update   rebase the patch branch onto the newest upstream release tag,
+#                     test, build the standalone binary, install it, push the branch
+#   omp-fork install  rebuild and install the branch as it is (no fetch, no rebase)
+#   omp-fork status   installed build, patch series, newest upstream release
+#   omp-fork setup    install this script and the omp-fork systemd user timer
+#
+# The rebase runs on a detached HEAD; the branch only moves after the new binary
+# built, passed its gates, and is installed. Any failure leaves the installed build
+# and the branch untouched and sends a notification.
+set -euo pipefail
+
+REPO="${OMP_FORK_REPO:-$HOME/projects/open-source/.worktrees/oh-my-pi_fork-stable}"
+BRANCH="${OMP_FORK_BRANCH:-tony/stable}"
+UPSTREAM="${OMP_FORK_UPSTREAM_REMOTE:-upstream}"
+ORIGIN="${OMP_FORK_ORIGIN_REMOTE:-origin}"
+PREFIX="${OMP_FORK_PREFIX:-$HOME/.local/lib/omp-fork}"
+BIN="${OMP_FORK_BIN:-$HOME/.local/bin/omp-dev}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omp-fork"
+NOTIFY_TO="${OMP_FORK_NOTIFY_TO:-195550206}"
+KEEP_BUILDS=3
+
+log() { printf 'omp-fork: %s\n' "$*" >&2; }
+
+notify() {
+	log "$1"
+	command -v agent-notify >/dev/null || return 0
+	agent-notify send --backend telegram-bot --markdown --to "$NOTIFY_TO" "*omp-fork*: $1" >/dev/null 2>&1 ||
+		log "notification failed"
+}
+
+die() {
+	notify "$1"
+	exit 1
+}
+
+git_() { git -C "$REPO" "$@"; }
+
+latest_release_tag() {
+	# Read all input: an early exit (head/grep -m1) SIGPIPEs git and pipefail aborts.
+	git_ tag -l 'v[0-9]*' --sort=-v:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ && !found { print; found = 1 }'
+}
+
+# The release tag the branch currently sits on.
+base_tag() {
+	git_ describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' --exclude '*-*' "$1"
+}
+
+installed_build() {
+	[[ -L "$BIN" ]] || return 0
+	basename "$(dirname "$(readlink "$BIN")")"
+}
+
+# Puts the prebuilt native addons for the checked-out version in place, unless the
+# fork patches native code, in which case they must be compiled.
+prepare_natives() {
+	local base=$1 version tmp
+	version=$(jq -r .version "$REPO/packages/natives/package.json")
+	if ! git_ diff --quiet "$base" HEAD -- crates packages/natives; then
+		log "patches touch native code; compiling natives"
+		(cd "$REPO" && bun run build:native)
+		return
+	fi
+	tmp=$(mktemp -d)
+	(cd "$tmp" && npm pack --silent "@oh-my-pi/pi-natives-linux-x64@$version" >/dev/null) ||
+		{ rm -rf "$tmp"; return 1; }
+	tar -xzf "$tmp"/*.tgz -C "$tmp"
+	# Rename over the destination, never write into it: if the destination is a link
+	# into an installed omp, an in-place write rewrites the addon every running omp
+	# has mapped and crashes them all (SIGSEGV/SIGBUS).
+	local addon dest
+	for addon in "$tmp"/package/pi_natives.linux-x64-*.node; do
+		dest="$REPO/packages/natives/native/$(basename "$addon")"
+		cp "$addon" "$dest.omp-fork-tmp" && mv -f "$dest.omp-fork-tmp" "$dest" || { rm -rf "$tmp"; return 1; }
+	done
+	rm -rf "$tmp"
+}
+
+# Builds HEAD and installs it. Prints the installed build id.
+build_and_install() {
+	local base=$1 version sha id dest
+	version=$(jq -r .version "$REPO/packages/coding-agent/package.json")
+	sha=$(git_ rev-parse --short=10 HEAD)
+	id="$version-$sha"
+
+	# Callers run this under `if !`/`||`, where errexit is off: check every step.
+	(cd "$REPO" && bun install --frozen-lockfile) >&2 || return 1
+	prepare_natives "$base" >&2 || return 1
+	(cd "$REPO/packages/coding-agent" && bun run check:types && bun test test/collab) >&2 || return 1
+	(cd "$REPO/packages/coding-agent" && bun run build) >&2 || return 1
+
+	local built="$REPO/packages/coding-agent/dist/omp" reported
+	reported=$("$built" --version) || return 1
+	[[ "$reported" == "omp/$version" ]] || { log "built binary reports '$reported', expected omp/$version"; return 1; }
+
+	dest="$PREFIX/$id"
+	mkdir -p "$dest" "$(dirname "$BIN")" || return 1
+	cp "$built" "$dest/omp.tmp" && mv -f "$dest/omp.tmp" "$dest/omp" || return 1
+	ln -sfn "$dest/omp" "$BIN.omp-fork-tmp" && mv -Tf "$BIN.omp-fork-tmp" "$BIN" || return 1
+	install -m 0755 "$REPO/fork/omp-fork" "$HOME/.local/bin/omp-fork" || return 1
+
+	# Running sessions keep their own inode; older builds are only disk space.
+	find "$PREFIX" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn |
+		tail -n +$((KEEP_BUILDS + 1)) | cut -d' ' -f2- | while read -r old; do
+		[[ "$old" == "$dest" ]] || rm -rf "$old"
+	done
+
+	mkdir -p "$STATE_DIR"
+	printf 'build=%s\nbase=%s\ncommit=%s\ninstalled_at=%s\n' "$id" "$base" "$(git_ rev-parse HEAD)" \
+		"$(date -Is)" >"$STATE_DIR/state"
+	printf '%s\n' "$id"
+}
+
+require_clean() {
+	[[ -z "$(git_ status --porcelain --untracked-files=no)" ]] || die "$REPO has uncommitted changes; not touching it"
+	[[ "$(git_ branch --show-current)" == "$BRANCH" ]] || die "$REPO is not on $BRANCH"
+}
+
+cmd_update() {
+	require_clean
+	git_ fetch -q --tags "$UPSTREAM" || die "fetching $UPSTREAM failed"
+	git_ fetch -q "$ORIGIN" || log "fetching $ORIGIN failed; continuing"
+
+	local base latest target id
+	base=$(base_tag "$BRANCH")
+	latest=$(latest_release_tag)
+	target=$base
+
+	if [[ "$latest" != "$base" ]]; then
+		if git_ merge-base --is-ancestor "$base" "$latest"; then
+			target=$latest
+		else
+			log "newest tag $latest does not descend from $base; staying on $base"
+		fi
+	fi
+	if [[ "$target" == "$base" && "$(installed_build)" == "$(jq -r .version "$REPO/packages/coding-agent/package.json")-$(git_ rev-parse --short=10 "$BRANCH")" ]]; then
+		log "up to date: $(installed_build) on $base"
+		return 0
+	fi
+	if [[ "$target" != "$base" ]] && ! npm view "@oh-my-pi/pi-natives-linux-x64@${target#v}" version >/dev/null 2>&1; then
+		log "$target is tagged but its natives are not on npm yet; retrying next run"
+		return 0
+	fi
+
+	git_ checkout -q --detach "$BRANCH"
+	if [[ "$target" != "$base" ]]; then
+		log "rebasing $BRANCH from $base onto $target"
+		if ! git_ rebase -q --empty=drop --onto "$target" "$base"; then
+			git_ rebase --abort || true
+			git_ checkout -q "$BRANCH"
+			die "rebasing the patches onto $target conflicts; resolve by hand in $REPO (still running $(installed_build))"
+		fi
+	fi
+
+	if ! id=$(build_and_install "$target"); then
+		git_ checkout -q -f "$BRANCH"
+		die "building $target + patches failed; still running $(installed_build)"
+	fi
+	git_ checkout -q -B "$BRANCH"
+	git_ push -q --force-with-lease "$ORIGIN" "$BRANCH" || log "pushing $BRANCH failed"
+	if [[ "$target" != "$base" ]]; then
+		notify "installed omp $id ($target + $(git_ rev-list --count "$target..$BRANCH") patches)"
+	else
+		log "installed omp $id"
+	fi
+}
+
+cmd_install() {
+	require_clean
+	local id
+	id=$(build_and_install "$(base_tag HEAD)") || die "building $BRANCH failed; still running $(installed_build)"
+	log "installed omp $id"
+}
+
+cmd_status() {
+	local base
+	base=$(base_tag "$BRANCH")
+	printf 'installed: %s -> %s\n' "$(installed_build)" "$(readlink "$BIN" 2>/dev/null || echo none)"
+	printf 'branch:    %s on %s (%s)\n' "$BRANCH" "$base" "$REPO"
+	git_ log --format='  %h %s' "$base..$BRANCH"
+	git_ fetch -q --tags "$UPSTREAM" 2>/dev/null || log "fetching $UPSTREAM failed; showing local tags"
+	printf 'upstream:  %s\n' "$(latest_release_tag)"
+}
+
+cmd_setup() {
+	local units="$HOME/.config/systemd/user"
+	install -Dm 0755 "$REPO/fork/omp-fork" "$HOME/.local/bin/omp-fork"
+	install -Dm 0644 "$REPO/fork/systemd/omp-fork.service" "$units/omp-fork.service"
+	install -Dm 0644 "$REPO/fork/systemd/omp-fork.timer" "$units/omp-fork.timer"
+	systemctl --user daemon-reload
+	systemctl --user enable --now omp-fork.timer
+}
+
+main() {
+	local cmd=${1:-help}
+	case "$cmd" in
+	update | install)
+		mkdir -p "$STATE_DIR"
+		exec 9>"$STATE_DIR/lock"
+		flock -n 9 || { log "another omp-fork run holds the lock"; exit 0; }
+		"cmd_$cmd"
+		;;
+	status | setup) "cmd_$cmd" ;;
+	*) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; [[ "$cmd" == help || "$cmd" == -h || "$cmd" == --help ]] ;;
+	esac
+}
+
+main "$@"
