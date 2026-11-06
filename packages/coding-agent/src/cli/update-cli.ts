@@ -351,15 +351,13 @@ export async function managedInstallName(binaryPath: string): Promise<string | u
 }
 
 /**
- * Whether the running omp may install its own updates: not a source checkout
- * (git updates it), not kept by a managing app (Tern updates its omp itself),
- * and not in the Nix store. Judged from the running build alone, without the
- * package-manager probes `omp update` runs.
+ * Whether the running omp may install its own updates. Never in this fork:
+ * omp-fork owns the install (`omp update` runs it, see `commands/update.ts`),
+ * and upstream's installer would replace the build with an unpatched release.
+ * So the background auto-update only notifies, and setup never offers it.
  */
 export async function canSelfUpdate(): Promise<boolean> {
-	if (isSourceCheckout()) return false;
-	if (isPathInDirectory(isCompiledBinary() ? process.execPath : import.meta.dir, NIX_STORE_DIR)) return false;
-	return (await managedInstallName(process.execPath)) === undefined;
+	return false;
 }
 
 function isSymlinkPath(p: string): boolean {

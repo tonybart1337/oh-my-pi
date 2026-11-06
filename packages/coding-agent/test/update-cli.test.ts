@@ -147,15 +147,36 @@ describe("update command plugin dispatch", () => {
 		expect(updateSpy).not.toHaveBeenCalled();
 	});
 
-	it("keeps normal update flags on the app updater path", async () => {
+	it("routes the app update through omp-fork, never upstream's updater", async () => {
 		const pluginSpy = spyOn(pluginCli, "runPluginCommand").mockResolvedValue(undefined);
 		const updateSpy = spyOn(updateCli, "runUpdateCommand").mockResolvedValue({ kind: "current" });
+		const spawnSpy = spyOn(Bun, "spawn").mockReturnValue({ exited: Promise.resolve(0) } as Bun.Subprocess);
+		const exitCode = process.exitCode;
 
-		const command = new Update(["--check", "--force"], TEST_CONFIG);
-		await command.run();
+		try {
+			await new Update(["--check"], TEST_CONFIG).run();
+			await new Update([], TEST_CONFIG).run();
+		} finally {
+			process.exitCode = exitCode;
+		}
 
-		expect(updateSpy).toHaveBeenCalledWith({ force: true, check: true, channel: undefined });
+		expect(spawnSpy.mock.calls.map(([cmd]) => cmd)).toEqual([
+			["omp-fork", "status"],
+			["omp-fork", "update"],
+		]);
+		expect(updateSpy).not.toHaveBeenCalled();
 		expect(pluginSpy).not.toHaveBeenCalled();
+	});
+
+	it("rejects upstream channel and force flags in the fork build", async () => {
+		const updateSpy = spyOn(updateCli, "runUpdateCommand").mockResolvedValue({ kind: "current" });
+		const spawnSpy = spyOn(Bun, "spawn");
+
+		for (const flag of ["--force", "--canary", "--stable"]) {
+			await expect(new Update([flag], TEST_CONFIG).run()).rejects.toThrow("fork build");
+		}
+		expect(spawnSpy).not.toHaveBeenCalled();
+		expect(updateSpy).not.toHaveBeenCalled();
 	});
 });
 
