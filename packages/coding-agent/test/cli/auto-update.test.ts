@@ -1,10 +1,13 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
 import {
 	type AutoUpdateState,
 	describeAutoUpdate,
 	RETRY_AFTER_MS,
+	runAutoUpdate,
 	shouldStartWorker,
 } from "@oh-my-pi/pi-coding-agent/cli/auto-update";
+import { canSelfUpdate } from "@oh-my-pi/pi-coding-agent/cli/update-cli";
+import * as sharedWorker from "@oh-my-pi/pi-coding-agent/subprocess/shared-worker";
 import { VERSION } from "@oh-my-pi/pi-utils";
 
 /** A version newer than the running build. */
@@ -21,6 +24,23 @@ describe("auto-update retry hold-off", () => {
 	it("holds off the same version until the previous attempt is RETRY_AFTER_MS old", () => {
 		expect(shouldStartWorker(finished, NEWER, 1_000 + RETRY_AFTER_MS - 1)).toBe(false);
 		expect(shouldStartWorker(finished, NEWER, 1_000 + RETRY_AFTER_MS)).toBe(true);
+	});
+});
+
+describe("auto-update in the fork build", () => {
+	it("only notifies about a newer release: omp-fork owns the install, no worker starts", async () => {
+		expect(await canSelfUpdate()).toBe(false);
+		const spawnSpy = spyOn(sharedWorker, "spawnDetached");
+		const show = mock();
+		const notify = mock();
+		try {
+			await runAutoUpdate(Promise.resolve(NEWER), { show, notify });
+		} finally {
+			spawnSpy.mockRestore();
+		}
+		expect(notify).toHaveBeenCalledWith(NEWER);
+		expect(show).not.toHaveBeenCalled();
+		expect(spawnSpy).not.toHaveBeenCalled();
 	});
 });
 
