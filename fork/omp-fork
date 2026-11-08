@@ -7,13 +7,14 @@
 #   omp-fork install  rebuild and install the branch as it is (no fetch, no rebase)
 #   omp-fork status   installed build, patch series, newest upstream release
 #   omp-fork setup    install this script and the omp-fork systemd user timer
-#   omp-fork resolve TAG  (internal) run the conflict-resolving agent for TAG
+#   omp-fork resolve TAG N  (internal) run the conflict-resolving agent for TAG, attempt N
 #
 # The rebase runs on a detached HEAD; the branch only moves after the new binary
 # built, passed its gates, and is installed. Any failure leaves the installed build
-# and the branch untouched and sends a notification. A rebase conflict also starts
-# an agent (once per target tag) in the transient unit omp-fork-resolve to redo the
-# rebase by hand and finish with `omp-fork update`.
+# and the branch untouched and sends a notification. Network steps (git fetch/push,
+# npm, bun install, notifications) retry with backoff. A rebase conflict also starts
+# an agent (up to RESOLVE_ATTEMPTS times per target tag, one per run) in the transient
+# unit omp-fork-resolve to redo the rebase by hand and finish with `omp-fork update`.
 set -euo pipefail
 
 REPO="${OMP_FORK_REPO:-$HOME/projects/open-source/.worktrees/oh-my-pi_fork-stable}"
@@ -26,15 +27,34 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omp-fork"
 NOTIFY_TO="${OMP_FORK_NOTIFY_TO:-195550206}"
 KEEP_BUILDS=3
 RESOLVE_UNIT=omp-fork-resolve
+# Agent runs per target tag, one per omp-fork run: the 6h timer spacing lets a
+# provider rate or usage limit reset before the next attempt.
+RESOLVE_ATTEMPTS=3
+# Tries per network command; the waits between them double from 5s.
+RETRY_ATTEMPTS=5
 # Headless agent that resolves rebase conflicts; the prompt is appended.
 RESOLVER=(agent run -p personal omp --auto-approve -p)
 
 log() { printf 'omp-fork: %s\n' "$*" >&2; }
 
+# Runs a command that can fail transiently (network) until it succeeds or
+# RETRY_ATTEMPTS ran out; returns the last exit status. Only for idempotent commands.
+retry() {
+	local attempt=1 delay=5 status
+	while true; do
+		"$@" && return 0
+		status=$?
+		((attempt < RETRY_ATTEMPTS)) || return "$status"
+		log "'$*' failed (exit $status, try $attempt/$RETRY_ATTEMPTS); retrying in ${delay}s"
+		sleep "$delay"
+		attempt=$((attempt + 1)) delay=$((delay * 2))
+	done
+}
+
 notify() {
 	log "$1"
 	command -v agent-notify >/dev/null || return 0
-	agent-notify send --backend telegram-bot --markdown --to "$NOTIFY_TO" "*omp-fork*: $1" >/dev/null 2>&1 ||
+	retry agent-notify send --backend telegram-bot --markdown --to "$NOTIFY_TO" "*omp-fork*: $1" >/dev/null 2>&1 ||
 		log "notification failed"
 }
 
@@ -45,12 +65,13 @@ die() {
 
 git_() { git -C "$REPO" "$@"; }
 
+npm_natives_versions() { npm view @oh-my-pi/pi-natives-linux-x64 versions --json 2>/dev/null; }
+
 # The newest vX.Y.Z tag whose prebuilt natives are on npm. Upstream sometimes tags a
 # version it never publishes; waiting on that tag would stall the fork forever.
 latest_release_tag() {
 	local published
-	published=$(npm view @oh-my-pi/pi-natives-linux-x64 versions --json 2>/dev/null |
-		jq -r '[.] | flatten | join(" ")') || return 1
+	published=$(retry npm_natives_versions | jq -r '[.] | flatten | join(" ")') || return 1
 	# Read all input: an early exit (head/grep -m1) SIGPIPEs git and pipefail aborts.
 	git_ tag -l 'v[0-9]*' --sort=-v:refname | awk -v published="$published" '
 		BEGIN { n = split(published, v, " "); for (i = 1; i <= n; i++) ok["v" v[i]] = 1 }
@@ -79,7 +100,7 @@ prepare_natives() {
 		return
 	fi
 	tmp=$(mktemp -d)
-	(cd "$tmp" && npm pack --silent "@oh-my-pi/pi-natives-linux-x64@$version" >/dev/null) ||
+	(cd "$tmp" && retry npm pack --silent "@oh-my-pi/pi-natives-linux-x64@$version" >/dev/null) ||
 		{ rm -rf "$tmp"; return 1; }
 	tar -xzf "$tmp"/*.tgz -C "$tmp"
 	# Rename over the destination, never write into it: if the destination is a link
@@ -101,7 +122,7 @@ build_and_install() {
 	id="$version-$sha"
 
 	# Callers run this under `if !`/`||`, where errexit is off: check every step.
-	(cd "$REPO" && bun install --frozen-lockfile) >&2 || return 1
+	(cd "$REPO" && retry bun install --frozen-lockfile) >&2 || return 1
 	prepare_natives "$base" >&2 || return 1
 	(cd "$REPO/packages/coding-agent" && bun run check:types && bun test test/collab) >&2 || return 1
 	(cd "$REPO/packages/coding-agent" && bun run build) >&2 || return 1
@@ -135,8 +156,8 @@ require_clean() {
 
 cmd_update() {
 	require_clean
-	git_ fetch -q --tags "$UPSTREAM" || die "fetching $UPSTREAM failed"
-	git_ fetch -q "$ORIGIN" || log "fetching $ORIGIN failed; continuing"
+	retry git_ fetch -q --tags "$UPSTREAM" || die "fetching $UPSTREAM failed"
+	retry git_ fetch -q "$ORIGIN" || log "fetching $ORIGIN failed; continuing"
 
 	local base latest target id
 	base=$(base_tag "$BRANCH")
@@ -171,7 +192,7 @@ cmd_update() {
 		die "building $target + patches failed; still running $(installed_build)"
 	fi
 	git_ checkout -q -B "$BRANCH"
-	git_ push -q --force-with-lease "$ORIGIN" "$BRANCH" || log "pushing $BRANCH failed"
+	retry git_ push -q --force-with-lease "$ORIGIN" "$BRANCH" || log "pushing $BRANCH failed"
 	if [[ "$target" != "$base" ]]; then
 		notify "installed omp $id ($target + $(git_ rev-list --count "$target..$BRANCH") patches)"
 	else
@@ -180,23 +201,27 @@ cmd_update() {
 }
 
 # Hands a conflicting rebase to an agent in a transient unit, so this run (and its
-# lock, which the agent's own `omp-fork update` needs) ends right away. Attempts
-# each target tag once: a failed attempt waits for a human or a newer tag.
+# lock, which the agent's own `omp-fork update` needs) ends right away. Each target
+# tag gets RESOLVE_ATTEMPTS agent runs, one per omp-fork run; after that it waits for
+# a human or a newer tag. The marker holds "<tag> <attempts started>".
 start_resolver() {
-	local target=$1 marker="$STATE_DIR/resolve-target" args=() var
-	if [[ "$(cat "$marker" 2>/dev/null)" == "$target" ]]; then
-		die "rebasing the patches onto $target conflicts and the agent already tried; resolve by hand in $REPO (still running $(installed_build))"
+	local target=$1 marker="$STATE_DIR/resolve-target" tag count tried=0 attempt args=() var
+	if read -r tag count 2>/dev/null <"$marker" && [[ "$tag" == "$target" ]]; then
+		tried=${count:-1}
 	fi
-	printf '%s\n' "$target" >"$marker"
+	if ((tried >= RESOLVE_ATTEMPTS)); then
+		die "rebasing the patches onto $target conflicts and the agent failed $tried times; resolve by hand in $REPO (still running $(installed_build))"
+	fi
+	attempt=$((tried + 1))
 	for var in PATH XDG_STATE_HOME ${!OMP_FORK_@}; do
 		[[ -n "${!var:-}" ]] && args+=("--setenv=$var=${!var}")
 	done
 	if systemd-run --user --quiet --collect --unit="$RESOLVE_UNIT" --property=RuntimeMaxSec=2h \
-		--property=Nice=10 "${args[@]}" -- "$(readlink -f "$0")" resolve "$target"; then
-		notify "rebasing the patches onto $target conflicts; an agent is resolving it (journalctl --user -u $RESOLVE_UNIT); still running $(installed_build)"
+		--property=Nice=10 "${args[@]}" -- "$(readlink -f "$0")" resolve "$target" "$attempt"; then
+		printf '%s %s\n' "$target" "$attempt" >"$marker"
+		notify "rebasing the patches onto $target conflicts; an agent is resolving it (attempt $attempt/$RESOLVE_ATTEMPTS, journalctl --user -u $RESOLVE_UNIT); still running $(installed_build)"
 	else
-		rm -f "$marker"
-		die "rebasing the patches onto $target conflicts and the agent could not start; resolve by hand in $REPO (still running $(installed_build))"
+		die "rebasing the patches onto $target conflicts and the agent could not start; the next run retries (still running $(installed_build))"
 	fi
 }
 
@@ -218,16 +243,22 @@ resolve_prompt() {
 
 # Runs inside $RESOLVE_UNIT; reports the outcome from the repo state, not the agent's word.
 cmd_resolve() {
-	local target=${1:?usage: omp-fork resolve TAG} status=0 expected
+	local target=${1:?usage: omp-fork resolve TAG ATTEMPT} attempt=${2:-1} status=0 expected
 	export OMP_FORK_RESOLVING=1
 	"${RESOLVER[@]}" "$(resolve_prompt "$target")" || status=$?
 	expected="$(jq -r .version "$REPO/packages/coding-agent/package.json")-$(git_ rev-parse --short=10 "$BRANCH")"
 	if [[ "$(git_ branch --show-current)" == "$BRANCH" && -z "$(git_ status --porcelain --untracked-files=no)" &&
 		"$(base_tag "$BRANCH")" == "$target" && "$(installed_build)" == "$expected" ]]; then
 		notify "the agent rebased onto $target and installed omp $expected ($(git_ rev-list --count "$target..$BRANCH") patches)"
-	else
-		die "the agent did not finish rebasing onto $target (exit $status); resolve by hand in $REPO (journalctl --user -u $RESOLVE_UNIT; still running $(installed_build))"
+		return 0
 	fi
+	# An agent cut off mid-rebase (crash, usage limit) would block the next attempt.
+	git_ rebase --abort >/dev/null 2>&1 || true
+	git_ checkout -q "$BRANCH" >/dev/null 2>&1 || true
+	if ((attempt < RESOLVE_ATTEMPTS)); then
+		die "the agent did not finish rebasing onto $target (exit $status, attempt $attempt/$RESOLVE_ATTEMPTS); the next omp-fork run retries (journalctl --user -u $RESOLVE_UNIT; still running $(installed_build))"
+	fi
+	die "the agent did not finish rebasing onto $target (exit $status) after $RESOLVE_ATTEMPTS attempts; resolve by hand in $REPO (journalctl --user -u $RESOLVE_UNIT; still running $(installed_build))"
 }
 
 cmd_install() {
@@ -243,7 +274,7 @@ cmd_status() {
 	printf 'installed: %s -> %s\n' "$(installed_build)" "$(readlink "$BIN" 2>/dev/null || echo none)"
 	printf 'branch:    %s on %s (%s)\n' "$BRANCH" "$base" "$REPO"
 	git_ log --format='  %h %s' "$base..$BRANCH"
-	git_ fetch -q --tags "$UPSTREAM" 2>/dev/null || log "fetching $UPSTREAM failed; showing local tags"
+	retry git_ fetch -q --tags "$UPSTREAM" 2>/dev/null || log "fetching $UPSTREAM failed; showing local tags"
 	printf 'upstream:  %s\n' "$(latest_release_tag || echo unknown)"
 }
 
