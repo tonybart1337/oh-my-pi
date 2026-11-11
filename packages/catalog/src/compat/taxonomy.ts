@@ -48,6 +48,13 @@ const MATCHER_RANK: Record<CompiledMatcher["kind"], number> = {
 	glob: 0,
 };
 
+const MODEL_FAMILIES = new Set(rules.taxonomy.classes.flatMap(cls => cls.families.map(family => family.id)));
+
+/** Whether a canonical family name is declared by the catalog taxonomy. */
+export function isModelFamily(family: string): boolean {
+	return MODEL_FAMILIES.has(family);
+}
+
 function bareOf(id: string): string {
 	const slash = id.lastIndexOf("/");
 	return slash === -1 ? id : id.slice(slash + 1);
