@@ -63,6 +63,7 @@ export function makeHostContext(snapshot: Snapshot, seen: HostObservations): Int
 		session: {
 			isStreaming: false,
 			queuedMessageCount: 0,
+			getQueuedMessages: () => ({ steering: [], followUp: [], liveSteered: 0 }),
 			sessionName: "queue",
 			model: undefined,
 			thinkingLevel: undefined,

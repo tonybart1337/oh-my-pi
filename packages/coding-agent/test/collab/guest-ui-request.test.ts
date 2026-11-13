@@ -480,6 +480,7 @@ function makeHostContext(): InteractiveModeContext {
 		session: {
 			isStreaming: false,
 			queuedMessageCount: 0,
+			getQueuedMessages: () => ({ steering: [], followUp: [], liveSteered: 0 }),
 			sessionName: "proto test",
 			model: undefined,
 			thinkingLevel: undefined,
