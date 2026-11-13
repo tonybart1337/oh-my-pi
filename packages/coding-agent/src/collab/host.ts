@@ -878,6 +878,10 @@ export class CollabHost {
 				if (this.#rejectWhileStarting("interrupting", fromPeer)) break;
 				this.#handleAbort(fromPeer);
 				break;
+			case "retry":
+				if (this.#rejectWhileStarting("retrying", fromPeer)) break;
+				this.#handleRetry(fromPeer);
+				break;
 			case "agent-cmd":
 				if (this.#rejectWhileStarting("agent control", fromPeer)) break;
 				this.#handleAgentCmd(frame.cmd, frame.agentId, frame.text, fromPeer);
@@ -1270,6 +1274,27 @@ export class CollabHost {
 		);
 	}
 
+	/** The guest's F5: re-attempt the last failed turn, or tell that guest there is none. */
+	#handleRetry(fromPeer: number): void {
+		const peer = this.#peers.get(fromPeer);
+		if (!peer?.canWrite) {
+			this.#rejectReadOnly("retrying", fromPeer);
+			return;
+		}
+		const name = peer.name;
+		void this.#ctx.session
+			.retry()
+			.then(didRetry => {
+				if (!this.#guestTrafficAllowed()) return;
+				if (didRetry) this.#ctx.session.emitNotice("info", `${name} retried the last turn`, "collab");
+				else this.#send({ t: "error", message: "Nothing to retry" }, fromPeer);
+			})
+			.catch(err => {
+				logger.warn("collab guest retry failed", { error: String(err) });
+				this.#send({ t: "error", message: `retry failed: ${String(err)}` }, fromPeer);
+			});
+	}
+
 	#handleAbort(fromPeer: number): void {
 		const peer = this.#peers.get(fromPeer);
 		if (!peer?.canWrite) {
@@ -1396,6 +1421,7 @@ export class CollabHost {
 				percent: breakdown.contextWindow > 0 ? (tokens / breakdown.contextWindow) * 100 : 0,
 			},
 			participants: this.participants,
+			guestRetry: true,
 		};
 	}
 

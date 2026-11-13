@@ -233,6 +233,8 @@ export interface SessionState {
 	contextUsage?: ContextUsage;
 	participants: Participant[];
 	isAborting?: boolean;
+	/** The host accepts the guest `retry` frame (hosts that predate it ignore the frame). */
+	guestRetry?: boolean;
 }
 
 export interface AgentSnapshot {
@@ -349,6 +351,8 @@ export type GuestFrame =
 	| { t: "prompt"; text: string; images?: ImageContent[] }
 	| { t: "ui-response"; reqId: number; value?: CollabUiResponseValue }
 	| { t: "abort" }
+	/** Re-attempt the last failed or aborted assistant turn, as the TUI's `app.retry` (F5) does. */
+	| { t: "retry" }
 	| { t: "agent-cmd"; cmd: "chat" | "kill" | "revive"; agentId: string; text?: string }
 	| { t: "fetch-transcript"; reqId: number; agentId: string; fromByte: number };
 
