@@ -28,6 +28,7 @@ function makeHostContext(eventBus: EventBus, notices: Notice[]): InteractiveMode
 			isAborting: false,
 			isSessionTransitioning: false,
 			queuedMessageCount: 0,
+			getQueuedMessages: () => ({ steering: [], followUp: [], liveSteered: 0 }),
 			sessionName: "host session",
 			model: undefined,
 			thinkingLevel: undefined,

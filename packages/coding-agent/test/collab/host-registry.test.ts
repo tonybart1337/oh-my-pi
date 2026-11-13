@@ -98,6 +98,7 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 				return state.isStreaming;
 			},
 			queuedMessageCount: 0,
+			getQueuedMessages: () => ({ steering: [], followUp: [], liveSteered: 0 }),
 			sessionName: "registry-test",
 			model: undefined,
 			thinkingLevel: undefined,

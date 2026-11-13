@@ -147,6 +147,7 @@ function makeControllerContext(over: { autoStart?: "off" | "view" | "control"; r
 			},
 			isStreaming: false,
 			queuedMessageCount: 0,
+			getQueuedMessages: () => ({ steering: [], followUp: [], liveSteered: 0 }),
 			sessionName: "controller-test",
 			model: { provider: "test-provider", id: "test-model" },
 			thinkingLevel: undefined,

@@ -107,6 +107,17 @@ function makeStreamingHostContext(): StreamingHostHarness {
 			get queuedMessageCount(): number {
 				return prompts.filter(prompt => prompt.options?.queueChipText).length;
 			},
+			takeQueuedMessage: (text: string, queue: "steering" | "followUp") => {
+				const index = prompts.findIndex(prompt => queue === "steering" && prompt.options?.queueChipText === text);
+				if (index < 0) return undefined;
+				prompts.splice(index, 1);
+				return { text };
+			},
+			getQueuedMessages: () => ({
+				steering: prompts.flatMap(prompt => prompt.options?.queueChipText ?? []),
+				followUp: [],
+				liveSteered: 0,
+			}),
 			isAborting: false,
 			sessionName: "test",
 			model: undefined,
@@ -205,13 +216,46 @@ describe("collab mid-turn guest prompts", () => {
 		expect(prompt.details).toEqual({ from: "writer" });
 		expect(prompt.options).toEqual({ streamingBehavior: "steer", queueChipText: "steer the host" });
 
-		// The queued steer must reach guests through state.queuedMessageCount —
-		// that field drives the web composer's "queued ×N" badge.
-		let sawQueuedCount = false;
-		for (let i = 0; i < 10 && !sawQueuedCount; i++) {
+		// The queued steer must reach guests through state: queuedMessageCount drives the
+		// "queued ×N" badge, and state.queue lists the message so a guest can take it back.
+		let sawQueued = false;
+		for (let i = 0; i < 10 && !sawQueued; i++) {
 			const frame = await guest.nextFrame();
-			if (frame.t === "state" && frame.state.queuedMessageCount === 1) sawQueuedCount = true;
+			if (frame.t === "state" && frame.state.queuedMessageCount === 1) {
+				expect(frame.state.queue).toEqual({ steering: ["steer the host"], followUp: [], liveSteered: 0 });
+				sawQueued = true;
+			}
 		}
-		expect(sawQueuedCount).toBe(true);
+		expect(sawQueued).toBe(true);
+	});
+
+	it("hands a queued steer back to the guest that takes it, once", async () => {
+		const relay = startTestRelay();
+		cleanups.push(relay.stop);
+		const harness = makeStreamingHostContext();
+		const host = new CollabHost(harness.ctx);
+		await host.start(relay.url);
+		cleanups.push(() => host.stop("test done"));
+
+		const guest = await joinAsGuest(host.link, "writer");
+		cleanups.push(() => guest.socket.close());
+		const welcome = await guest.nextFrame();
+		if (welcome.t !== "welcome") throw new Error(`expected welcome, got ${welcome.t}`);
+
+		const prompted = harness.nextPrompt();
+		guest.socket.send({ t: "prompt", text: "edit me" });
+		await prompted;
+
+		const reply = async (reqId: number): Promise<CollabFrame> => {
+			for (;;) {
+				const frame = await guest.nextFrame();
+				if (frame.t === "unqueued" && frame.reqId === reqId) return frame;
+			}
+		};
+		guest.socket.send({ t: "unqueue", reqId: 1, queue: "steering", text: "edit me" });
+		expect(await reply(1)).toEqual({ t: "unqueued", reqId: 1, message: { text: "edit me" } });
+		expect(harness.prompts).toHaveLength(0);
+		guest.socket.send({ t: "unqueue", reqId: 2, queue: "steering", text: "edit me" });
+		expect(await reply(2)).toEqual({ t: "unqueued", reqId: 2, message: null });
 	});
 });

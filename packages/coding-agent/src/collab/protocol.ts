@@ -100,6 +100,7 @@ export type CollabFrame =
 	| { t: "ui-request-end"; reqId: number }
 	/** Targeted reply to fetch-transcript; `error` marks a terminal read failure that guests must surface without hot retrying. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
+	| { t: "unqueued"; reqId: number; message: { text: string; images?: ImageContent[] } | null }
 	| { t: "bye"; reason: string }
 	/** `resync`: the host no longer counts this guest as joined; the guest should send `hello` again. */
 	| { t: "error"; message: string; resync?: true };

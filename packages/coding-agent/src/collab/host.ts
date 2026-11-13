@@ -77,6 +77,7 @@ const STATE_TRIGGER_EVENTS: Record<string, true> = {
 	model_changed: true,
 	advisor_cost_changed: true,
 	auto_compaction_end: true,
+	queue_update: true,
 };
 
 const STATE_DEBOUNCE_MS = 100;
@@ -882,6 +883,9 @@ export class CollabHost {
 				if (this.#rejectWhileStarting("retrying", fromPeer)) break;
 				this.#handleRetry(fromPeer);
 				break;
+			case "unqueue":
+				this.#handleUnqueue(frame.reqId, frame.queue, frame.text, fromPeer);
+				break;
 			case "agent-cmd":
 				if (this.#rejectWhileStarting("agent control", fromPeer)) break;
 				this.#handleAgentCmd(frame.cmd, frame.agentId, frame.text, fromPeer);
@@ -1274,6 +1278,22 @@ export class CollabHost {
 		);
 	}
 
+	/** Hand a queued message back to the guest that asked, for editing; null once it was delivered. */
+	#handleUnqueue(reqId: number, queue: "steering" | "followUp", text: string, fromPeer: number): void {
+		if (!this.#peers.get(fromPeer)?.canWrite) {
+			this.#rejectReadOnly("editing queued messages", fromPeer);
+			return;
+		}
+		const taken =
+			queue === "steering" || queue === "followUp" ? this.#ctx.session.takeQueuedMessage(text, queue) : undefined;
+		this.#send({ t: "unqueued", reqId, message: taken ?? null }, fromPeer);
+		if (taken) {
+			this.#ctx.updatePendingMessagesDisplay();
+			this.#ctx.ui.requestRender();
+			this.#scheduleStateBroadcast();
+		}
+	}
+
 	/** The guest's F5: re-attempt the last failed turn, or tell that guest there is none. */
 	#handleRetry(fromPeer: number): void {
 		const peer = this.#peers.get(fromPeer);
@@ -1422,7 +1442,13 @@ export class CollabHost {
 			},
 			participants: this.participants,
 			guestRetry: true,
+			queue: this.#queueState(),
 		};
+	}
+
+	#queueState(): { steering: string[]; followUp: string[]; liveSteered: number } {
+		const queued = this.#ctx.session.getQueuedMessages();
+		return { steering: [...queued.steering], followUp: [...queued.followUp], liveSteered: queued.liveSteered };
 	}
 
 	#onEventForState(event: AgentSessionEvent): void {

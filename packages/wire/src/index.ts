@@ -235,6 +235,12 @@ export interface SessionState {
 	isAborting?: boolean;
 	/** The host accepts the guest `retry` frame (hosts that predate it ignore the frame). */
 	guestRetry?: boolean;
+	/**
+	 * User messages waiting in the host's queues, as the TUI's queue chips show them. The
+	 * first `liveSteered` steering entries already went to the streaming response and can no
+	 * longer be taken back; the rest can, with the guest `unqueue` frame.
+	 */
+	queue?: { steering: string[]; followUp: string[]; liveSteered: number };
 }
 
 export interface AgentSnapshot {
@@ -353,6 +359,8 @@ export type GuestFrame =
 	| { t: "abort" }
 	/** Re-attempt the last failed or aborted assistant turn, as the TUI's `app.retry` (F5) does. */
 	| { t: "retry" }
+	/** Take a queued message back for editing; answered by `unqueued` with the same `reqId`. */
+	| { t: "unqueue"; reqId: number; queue: "steering" | "followUp"; text: string }
 	| { t: "agent-cmd"; cmd: "chat" | "kill" | "revive"; agentId: string; text?: string }
 	| { t: "fetch-transcript"; reqId: number; agentId: string; fromByte: number };
 
@@ -398,6 +406,8 @@ export type HostFrame =
 	| { t: "ui-request-end"; reqId: number }
 	/** Targeted reply to fetch-transcript; `text` is decoded JSONL from `fromByte`, `newSize` the next offset base. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
+	/** Answer to `unqueue`: the removed message, or null when it was already delivered. */
+	| { t: "unqueued"; reqId: number; message: { text: string; images?: ImageContent[] } | null }
 	| { t: "bye"; reason: string }
 	/** `resync`: the host no longer counts this guest as joined; the guest should send `hello` again. */
 	| { t: "error"; message: string; resync?: true };

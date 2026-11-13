@@ -61,6 +61,7 @@ function makeHostContext(sessionId: string): InteractiveModeContext {
 		session: {
 			isStreaming: false,
 			queuedMessageCount: 0,
+			getQueuedMessages: () => ({ steering: [], followUp: [], liveSteered: 0 }),
 			sessionName: "isolation-test",
 			model: undefined,
 			thinkingLevel: undefined,
