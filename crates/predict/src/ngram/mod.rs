@@ -125,22 +125,40 @@ impl NgramPredictor {
 	/// Returns an error when the snapshot exists but cannot be read, has an
 	/// unknown version, or is corrupt.
 	pub fn open(config: &Config, params: Params) -> anyhow::Result<Self> {
-		let web = web::web_prior()?;
-		let gate = config.show_threshold;
 		let path = config.state_dir.join(SNAPSHOT_FILE);
-		let model = match std::fs::read(&path) {
-			Ok(bytes) => snapshot::decode(&bytes, params, web)
-				.with_context(|| format!("restore {}", path.display()))?,
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-				model::Model::new(params, web)
-			},
+		let bytes = match std::fs::read(&path) {
+			Ok(bytes) => Some(bytes),
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
 			Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+		};
+		let mut engine = Self::from_snapshot(bytes.as_deref(), params, config.show_threshold)
+			.with_context(|| format!("restore {}", path.display()))?;
+		engine.state_dir.clone_from(&config.state_dir);
+		Ok(engine)
+	}
+
+	/// Restore from snapshot bytes as [`Predictor::persist`] writes them, or
+	/// start empty for `None`. For hosts without the state directory, such as
+	/// a browser build fed a copy of the snapshot; the result has no state
+	/// directory, so persisting it fails.
+	///
+	/// # Errors
+	/// Returns an error when the snapshot has an unknown version or is corrupt.
+	pub fn from_snapshot(
+		snapshot: Option<&[u8]>,
+		params: Params,
+		show_threshold: Option<f32>,
+	) -> anyhow::Result<Self> {
+		let web = web::web_prior()?;
+		let model = match snapshot {
+			Some(bytes) => snapshot::decode(bytes, params, web)?,
+			None => model::Model::new(params, web),
 		};
 		Ok(Self {
 			model,
 			query: query::QueryState::default(),
-			gate,
-			state_dir: config.state_dir.clone(),
+			gate: show_threshold,
+			state_dir: PathBuf::new(),
 		})
 	}
 
