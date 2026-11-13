@@ -15,6 +15,7 @@ function makeHostContext(manager: SessionManager): InteractiveModeContext {
 		session: {
 			isStreaming: false,
 			queuedMessageCount: 0,
+			getQueuedMessages: () => ({ steering: [], followUp: [], liveSteered: 0 }),
 			sessionName: "discard marker",
 			model: undefined,
 			thinkingLevel: undefined,

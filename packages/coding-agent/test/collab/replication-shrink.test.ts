@@ -218,6 +218,7 @@ function makeHostHarness(sessionManager: HostReplicationSource): HostHarness {
 			isStreaming: false,
 			isAborting: false,
 			queuedMessageCount: 0,
+			getQueuedMessages: () => ({ steering: [], followUp: [], liveSteered: 0 }),
 			sessionName: "big",
 			model: undefined,
 			thinkingLevel: undefined,

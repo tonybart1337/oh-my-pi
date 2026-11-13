@@ -67,6 +67,7 @@ function makeHostContext(snapshot: SizedSnapshot): InteractiveModeContext {
 		session: {
 			isStreaming: false,
 			queuedMessageCount: 0,
+			getQueuedMessages: () => ({ steering: [], followUp: [], liveSteered: 0 }),
 			sessionName: "large",
 			model: undefined,
 			thinkingLevel: undefined,

@@ -48,6 +48,7 @@ function makeFixture(): Fixture {
 				return fixture.isStreaming;
 			},
 			queuedMessageCount: 0,
+			getQueuedMessages: () => ({ steering: [], followUp: [], liveSteered: 0 }),
 			sessionName: "no-peer-test",
 			model: undefined,
 			thinkingLevel: undefined,
