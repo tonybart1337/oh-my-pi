@@ -156,7 +156,8 @@ require_clean() {
 
 cmd_update() {
 	require_clean
-	retry git_ fetch -q --tags "$UPSTREAM" || die "fetching $UPSTREAM failed"
+	# --force: upstream re-tags releases; its tags are authoritative over stale local ones.
+	retry git_ fetch -q --tags --force "$UPSTREAM" || die "fetching $UPSTREAM failed"
 	retry git_ fetch -q "$ORIGIN" || log "fetching $ORIGIN failed; continuing"
 
 	local base latest target id
@@ -274,7 +275,7 @@ cmd_status() {
 	printf 'installed: %s -> %s\n' "$(installed_build)" "$(readlink "$BIN" 2>/dev/null || echo none)"
 	printf 'branch:    %s on %s (%s)\n' "$BRANCH" "$base" "$REPO"
 	git_ log --format='  %h %s' "$base..$BRANCH"
-	retry git_ fetch -q --tags "$UPSTREAM" 2>/dev/null || log "fetching $UPSTREAM failed; showing local tags"
+	retry git_ fetch -q --tags --force "$UPSTREAM" 2>/dev/null || log "fetching $UPSTREAM failed; showing local tags"
 	printf 'upstream:  %s\n' "$(latest_release_tag || echo unknown)"
 }
 
