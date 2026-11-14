@@ -96,7 +96,12 @@ prepare_natives() {
 	version=$(jq -r .version "$REPO/packages/natives/package.json")
 	if ! git_ diff --quiet "$base" HEAD -- crates packages/natives; then
 		log "patches touch native code; compiling natives"
-		(cd "$REPO" && bun run build:native)
+		# rust-toolchain.toml pins upstream's nightly. mise's global rust pin (its shims,
+		# and the RUSTUP_TOOLCHAIN that every shimmed tool, bun included, re-exports) would
+		# override it and fail the crates' rust-version: drop mise's rust and call rustup's
+		# own proxies, which honor the toolchain file.
+		(cd "$REPO" && MISE_DISABLE_TOOLS=rust env -u RUSTUP_TOOLCHAIN \
+			PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH" bun run build:native)
 		return
 	fi
 	tmp=$(mktemp -d)
