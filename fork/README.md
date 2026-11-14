@@ -26,7 +26,8 @@ The agent redoes the rebase on a detached HEAD, resolves the conflicts, runs the
 and finishes with `omp-fork update`. When the unit ends, `omp-fork resolve` checks the
 repo itself (on `tony/stable`, clean, on the target tag, that build installed) and
 notifies success or failure; on failure it aborts any rebase the agent left behind and
-returns the worktree to `tony/stable`. While the unit is active, other `update`/`install`
+returns the worktree to `tony/stable`. The agent's own `omp-fork update` runs only log, so
+that is the one message per attempt. While the unit is active, other `update`/`install`
 runs skip. Each target tag gets 3 attempts, one per `omp-fork` run, so the 6h timer
 spacing lets a provider rate or usage limit reset in between
 (`~/.local/state/omp-fork/resolve-target` holds `<tag> <attempts>`). After the third
