@@ -51,8 +51,11 @@ retry() {
 	done
 }
 
+# Runs the resolver agent starts only log: they fail while it iterates, and
+# cmd_resolve sends the one outcome message.
 notify() {
 	log "$1"
+	[[ -z "${OMP_FORK_RESOLVING:-}" ]] || return 0
 	command -v agent-notify >/dev/null || return 0
 	retry agent-notify send --backend telegram-bot --markdown --to "$NOTIFY_TO" "*omp-fork*: $1" >/dev/null 2>&1 ||
 		log "notification failed"
@@ -250,8 +253,7 @@ resolve_prompt() {
 # Runs inside $RESOLVE_UNIT; reports the outcome from the repo state, not the agent's word.
 cmd_resolve() {
 	local target=${1:?usage: omp-fork resolve TAG ATTEMPT} attempt=${2:-1} status=0 expected
-	export OMP_FORK_RESOLVING=1
-	"${RESOLVER[@]}" "$(resolve_prompt "$target")" || status=$?
+	OMP_FORK_RESOLVING=1 "${RESOLVER[@]}" "$(resolve_prompt "$target")" || status=$?
 	expected="$(jq -r .version "$REPO/packages/coding-agent/package.json")-$(git_ rev-parse --short=10 "$BRANCH")"
 	if [[ "$(git_ branch --show-current)" == "$BRANCH" && -z "$(git_ status --porcelain --untracked-files=no)" &&
 		"$(base_tag "$BRANCH")" == "$target" && "$(installed_build)" == "$expected" ]]; then
