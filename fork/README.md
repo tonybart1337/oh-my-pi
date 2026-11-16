@@ -20,7 +20,7 @@ the branch untouched and notify via `agent-notify` (Telegram). Network steps (gi
 fetch/push to GitHub, npm, `bun install`, the notification itself) retry up to 5 times
 with doubling waits from 5s before they count as failed.
 
-A rebase conflict starts a headless agent (`agent run -p personal omp --auto-approve -p
+A rebase conflict starts a headless agent (`agent run -p system omp --auto-approve -p
 <prompt>`) in the transient user unit `omp-fork-resolve`; the timer run exits at once.
 The agent redoes the rebase on a detached HEAD, resolves the conflicts, runs the gates,
 and finishes with `omp-fork update`. When the unit ends, `omp-fork resolve` checks the
