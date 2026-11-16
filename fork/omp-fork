@@ -32,8 +32,9 @@ RESOLVE_UNIT=omp-fork-resolve
 RESOLVE_ATTEMPTS=3
 # Tries per network command; the waits between them double from 5s.
 RETRY_ATTEMPTS=5
-# Headless agent that resolves rebase conflicts; the prompt is appended.
-RESOLVER=(agent run -p personal omp --auto-approve -p)
+# Headless agent that resolves rebase conflicts; the prompt is appended. The
+# `system` profile shares personal's workspace and memory but is never notified.
+RESOLVER=(agent run -p system omp --auto-approve -p)
 
 log() { printf 'omp-fork: %s\n' "$*" >&2; }
 
