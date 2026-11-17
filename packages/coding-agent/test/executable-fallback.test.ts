@@ -250,6 +250,17 @@ process.stdout.write(Bun.spawnSync([exe, "-e", "console.log('running build')"]).
 		expect(resolveRestartCmd()).toEqual([devBuild]);
 	});
 
+	it("restarts the running build when the launcher no longer resolves", () => {
+		vi.spyOn(utils, "isCompiledBinary").mockReturnValue(true);
+		const running = "/home/u/.local/lib/omp-fork/18.8.6-old/omp";
+		setProcessProp("execPath", running);
+		setProcessProp("argv0", "omp");
+		vi.spyOn(utils, "$which").mockReturnValue(null);
+		vi.spyOn(utils, "isExecutable").mockImplementation((p: string) => p === running);
+
+		expect(resolveRestartCmd()).toEqual([running]);
+	});
+
 	// cmd.exe runs `omp` from the current directory before PATH and passes argv0 as typed, so on
 	// Windows a bare argv0 cannot say which copy is running.
 	it.skipIf(process.platform !== "win32")("restarts a bare-named Windows launch as itself", () => {
