@@ -12,7 +12,8 @@
 # The rebase runs on a detached HEAD; the branch only moves after the new binary
 # built, passed its gates, and is installed. Any failure leaves the installed build
 # and the branch untouched and sends a notification. Network steps (git fetch/push,
-# npm, bun install, notifications) retry with backoff. A rebase conflict also starts
+# npm, bun install) retry with backoff; agent-notify retries on its own, only where
+# a resend cannot duplicate the message. A rebase conflict also starts
 # an agent (up to RESOLVE_ATTEMPTS times per target tag, one per run) in the transient
 # unit omp-fork-resolve to redo the rebase by hand and finish with `omp-fork update`.
 set -euo pipefail
@@ -53,12 +54,13 @@ retry() {
 }
 
 # Runs the resolver agent starts only log: they fail while it iterates, and
-# cmd_resolve sends the one outcome message.
+# cmd_resolve sends the one outcome message. No `retry`: a send that timed out or
+# got a 5xx may still have been delivered, and agent-notify retries the safe cases.
 notify() {
 	log "$1"
 	[[ -z "${OMP_FORK_RESOLVING:-}" ]] || return 0
 	command -v agent-notify >/dev/null || return 0
-	retry agent-notify send --backend telegram-bot --markdown --to "$NOTIFY_TO" "*omp-fork*: $1" >/dev/null 2>&1 ||
+	agent-notify send --backend telegram-bot --markdown --to "$NOTIFY_TO" "*omp-fork*: $1" >/dev/null ||
 		log "notification failed"
 }
 
