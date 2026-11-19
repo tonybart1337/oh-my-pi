@@ -7,6 +7,9 @@
 ### Fixed
 
 - Fixed Codex service tiers, such as Ultrafast, being hidden for accounts that support them when the first logged-in account has a plan that does not.
+### Added
+
+- Added distinct Sol, Terra, and Luna catalog families across GPT revisions while retaining their existing provider effort and pricing policies
 
 ## [19.2.0] - 2026-11-25
 

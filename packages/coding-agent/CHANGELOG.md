@@ -42,6 +42,13 @@
 - Fixed idle follow-ups becoming stuck after extension messages or compaction summaries.
 - Fixed resuming goals whose token budget is exhausted so they remain budget-limited, and prevented incomplete-goal reminders from asking the agent to continue while budget-limited.
 - Assistant replies show SVG fences and HTML image and page embeds inline again on terminals that support graphics ([#20508](https://github.com/can1357/oh-my-pi/issues/20508)).
+### Added
+
+- Added provider-scoped model-ID glob keys in retry fallback chains, with ordinary latest-family and effort selectors as fallback targets
+
+### Fixed
+
+- Family selectors such as `opus`, `sol-latest`, and `provider/sol-latest:auto` now choose the newest available numeric catalog revision before usage preferences, while exact model IDs stay pinned
 
 ## [19.2.0] - 2026-11-25
 
