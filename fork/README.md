@@ -35,7 +35,9 @@ failure, rebase by hand in the `tony/stable` worktree, then run `omp-fork update
 agent's final summary lands in `journalctl --user -u omp-fork-resolve`.
 
 Native addons come prebuilt from npm (`@oh-my-pi/pi-natives-linux-x64@<version>`);
-they are compiled locally only when the patches touch `crates/` or `packages/natives`.
+when the patches touch `crates/` or `packages/natives`, the host's addon (modern) is
+then compiled locally over its prebuilt one. The baseline addon stays upstream's, since
+the build refuses any addon stamped with another version.
 
 ## Adding a patch
 
