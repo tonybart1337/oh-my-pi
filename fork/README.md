@@ -39,6 +39,13 @@ when the patches touch `crates/` or `packages/natives`, the host's addon (modern
 then compiled locally over its prebuilt one. The baseline addon stays upstream's, since
 the build refuses any addon stamped with another version.
 
+After every install, `omp-fork` starts the new build once per omp home
+(`~/.local/share/agent/*/omp-home`, `~/.omp/agent`; rpc mode with stdin closed, so no
+model call) and notifies any `Failed to load extension` it prints. Extensions import
+`@oh-my-pi/*` modules from the binary's bundle, so an upstream release that moves one
+(v19.2.0 moved most of `pi-tui` into `pi-coding-agent`) breaks them silently otherwise.
+The install is not rolled back: the fix belongs in the extension.
+
 ## Adding a patch
 
 Commit it on `tony/stable` (upstreamable fixes also go on their own branch for a PR),

@@ -166,6 +166,30 @@ require_clean() {
 	[[ "$(git_ branch --show-current)" == "$BRANCH" ]] || die "$REPO is not on $BRANCH"
 }
 
+# Extensions resolve @oh-my-pi/* imports against modules bundled into the binary, so a
+# release that moves one breaks them at startup, and omp only warns. Starts the
+# installed build once per omp home (rpc mode, stdin closed: no model call) with that
+# home's extensions, as a real session loads them, and prints every load failure.
+broken_extensions() {
+	local home
+	for home in "$HOME"/.local/share/agent/*/omp-home "$HOME"/.omp/agent "$HOME"/.omp/profiles/*/agent; do
+		[[ -d "$home" ]] || continue
+		(cd /tmp && PI_CODING_AGENT_DIR="$home" timeout 30 "$BIN" --mode rpc --no-ui --no-session --no-lsp </dev/null 2>&1) |
+			grep 'Failed to load extension' || true
+	done | sort -u
+}
+
+# Never blocks an install: the fix lives in the extension, not in the fork.
+report_extensions() {
+	local broken
+	broken=$(broken_extensions)
+	[[ -z "$broken" ]] && return 0
+	notify "omp $(installed_build) fails to load extensions; fix their imports (moved modules), then reinstall them:
+\`\`\`
+$broken
+\`\`\`"
+}
+
 cmd_update() {
 	require_clean
 	# --force: upstream re-tags releases; its tags are authoritative over stale local ones.
@@ -211,6 +235,7 @@ cmd_update() {
 	else
 		log "installed omp $id"
 	fi
+	report_extensions
 }
 
 # Hands a conflicting rebase to an agent in a transient unit, so this run (and its
@@ -249,6 +274,7 @@ resolve_prompt() {
 	3. After each resolved commit, and at the end: cd packages/coding-agent && bun run check:types && bun test test/collab. All must pass.
 	4. Finish with: git checkout -B $BRANCH && omp-fork update. That builds, installs, and pushes; it must log "installed omp".
 	5. If upstream changed the fork in a way future rebases should know, add a short dated line to memory/omp-fork.md.
+	6. If omp-fork logs "fails to load extensions", the new build no longer bundles a module an installed extension imports (upstream moved it). Find where it lives now in $REPO/packages, fix the import in the extension's source (agent-omp-ui: ~/projects/agents/tools/crates/omp-ui/native-controls.ts, installed into every omp home's extensions/ as agent-omp-ui-controls.ts), copy it over each installed copy, and leave the source change uncommitted for Tony.
 
 	If you cannot resolve it correctly, run git rebase --abort && git checkout $BRANCH in $REPO so the worktree is clean, and explain why. End your reply with a summary of each conflict and how you resolved it.
 	EOF
@@ -262,6 +288,7 @@ cmd_resolve() {
 	if [[ "$(git_ branch --show-current)" == "$BRANCH" && -z "$(git_ status --porcelain --untracked-files=no)" &&
 		"$(base_tag "$BRANCH")" == "$target" && "$(installed_build)" == "$expected" ]]; then
 		notify "the agent rebased onto $target and installed omp $expected ($(git_ rev-list --count "$target..$BRANCH") patches)"
+		report_extensions
 		return 0
 	fi
 	# An agent cut off mid-rebase (crash, usage limit) would block the next attempt.
@@ -278,6 +305,7 @@ cmd_install() {
 	local id
 	id=$(build_and_install "$(base_tag HEAD)") || die "building $BRANCH failed; still running $(installed_build)"
 	log "installed omp $id"
+	report_extensions
 }
 
 cmd_status() {
